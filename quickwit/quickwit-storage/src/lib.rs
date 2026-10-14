@@ -26,6 +26,8 @@
 //!
 //! The `BundleStorage` bundles together multiple files into a single file.
 mod cache;
+#[cfg(any(test, feature = "testsuite", feature = "integration-testsuite"))]
+mod conditional_writes_test_suite;
 mod counting_storage;
 mod debouncer;
 mod file_descriptor_cache;
@@ -36,7 +38,7 @@ pub use debouncer::AsyncDebouncer;
 pub(crate) use debouncer::DebouncedStorage;
 
 pub use self::payload::PutPayload;
-pub use self::storage::{ListObjectsStream, ObjectMetadata, Storage};
+pub use self::storage::{ListObjectsStream, ObjectMetadata, ObjectVersion, Storage};
 
 mod bundle_storage;
 mod error;
@@ -68,6 +70,10 @@ pub use self::cache::MockStorageCache;
 pub use self::cache::{
     ByteRangeCache, FileByteRangeCache, MemorySizedCache, QuickwitCache, StorageCache,
     wrap_storage_with_cache,
+};
+#[cfg(any(test, feature = "testsuite", feature = "integration-testsuite"))]
+pub use self::conditional_writes_test_suite::{
+    storage_test_conditional_writes, storage_test_conditional_writes_unsupported,
 };
 pub use self::counting_storage::{CountingStorage, DownloadCounters};
 pub use self::local_file_storage::{LocalFileStorage, LocalFileStorageFactory};

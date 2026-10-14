@@ -23,7 +23,9 @@ use tantivy::directory::OwnedBytes;
 use tokio::io::AsyncRead;
 
 use crate::storage::SendableAsync;
-use crate::{BulkDeleteError, ListObjectsStream, PutPayload, Storage, StorageResult};
+use crate::{
+    BulkDeleteError, ListObjectsStream, ObjectVersion, PutPayload, Storage, StorageResult,
+};
 
 /// Per-request download counters tracked by [`CountingStorage`].
 ///
@@ -132,6 +134,34 @@ impl Storage for CountingStorage {
         let bytes = self.inner.get_all(path).await?;
         self.counters.record_read(bytes.len() as u64);
         Ok(bytes)
+    }
+
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        self.inner.put_if_absent(path, payload).await
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        self.inner
+            .put_if_version_matches(path, payload, expected_version)
+            .await
+    }
+
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        let (bytes, version) = self.inner.get_all_with_version(path).await?;
+        self.counters.record_read(bytes.len() as u64);
+        Ok((bytes, version))
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {

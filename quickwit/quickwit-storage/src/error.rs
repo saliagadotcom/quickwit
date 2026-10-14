@@ -37,6 +37,11 @@ pub enum StorageErrorKind {
     Timeout,
     /// Io error.
     Io,
+    /// A conditional write was rejected because the object did not have the expected state
+    /// (see [`crate::Storage::put_if_absent`] and [`crate::Storage::put_if_version_matches`]).
+    PreconditionFailed,
+    /// The storage backend does not support the requested operation.
+    Unsupported,
 }
 
 /// Generic Storage Resolver Error.

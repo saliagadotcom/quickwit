@@ -28,7 +28,9 @@ use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::error;
 
-use crate::{BulkDeleteError, OwnedBytes, PutPayload, StorageErrorKind, StorageResult};
+use crate::{
+    BulkDeleteError, OwnedBytes, PutPayload, StorageError, StorageErrorKind, StorageResult,
+};
 
 /// Metadata for an object listed from storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +45,41 @@ pub struct ObjectMetadata {
 
 /// Stream of object metadata batches returned by [`Storage::list`].
 pub type ListObjectsStream = BoxStream<'static, StorageResult<Vec<ObjectMetadata>>>;
+
+/// Opaque version of a stored object, as compared by conditional writes.
+///
+/// The token is backend-specific: on S3 it is the object's ETag, on the RAM storage a counter.
+/// Two versions compare equal if and only if their tokens are equal; nothing else (ordering,
+/// format) may be assumed about them.
+///
+/// Hidden contract: a version is only meaningful for the object it was obtained from, via
+/// [`Storage::get_all_with_version`], [`Storage::put_if_absent`] or
+/// [`Storage::put_if_version_matches`] on the same path and storage.
+///
+/// Backends whose version is a content hash (S3 ETag) hand out the same version again when an
+/// object is overwritten with byte-identical content. A compare-and-swap against such a version
+/// can therefore succeed even though another writer overwrote the object in between, as long as
+/// that writer did not change the bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectVersion(String);
+
+impl ObjectVersion {
+    /// Wraps the backend's opaque version token.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// Returns the opaque version token.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ObjectVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// This trait is only used to make it build trait object with `AsyncWrite + Send + Unpin`.
 pub trait SendableAsync: AsyncWrite + Send + Unpin {}
@@ -71,6 +108,67 @@ pub trait Storage: fmt::Debug + Send + Sync + 'static {
 
     /// Saves a file into the storage.
     async fn put(&self, path: &Path, payload: Box<dyn PutPayload>) -> StorageResult<()>;
+
+    /// Saves a file into the storage, but only if no object exists at `path` yet.
+    ///
+    /// On success, returns the version of the object that was written. Fails with
+    /// [`StorageErrorKind::PreconditionFailed`] if an object already exists at `path`, in which
+    /// case the existing object is left untouched. Fails with [`StorageErrorKind::Unsupported`]
+    /// if the backend cannot write conditionally; this is the default implementation.
+    ///
+    /// Concurrent callers racing on the same absent path observe exactly one success.
+    async fn put_if_absent(
+        &self,
+        _path: &Path,
+        _payload: Box<dyn PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        Err(unsupported_operation_error(
+            self.uri(),
+            "conditional writes",
+        ))
+    }
+
+    /// Saves a file into the storage, but only if the object stored at `path` still has version
+    /// `expected_version`.
+    ///
+    /// On success, returns the version of the object that was written. Fails with
+    /// [`StorageErrorKind::PreconditionFailed`] if the object's current version differs from
+    /// `expected_version`, with [`StorageErrorKind::NotFound`] if no object exists at `path`
+    /// anymore, and with [`StorageErrorKind::Unsupported`] if the backend cannot write
+    /// conditionally; this is the default implementation. On failure the stored object is left
+    /// untouched.
+    ///
+    /// Concurrent callers racing with the same `expected_version` observe exactly one success.
+    ///
+    /// Hidden contract: `expected_version` must come from [`Storage::get_all_with_version`],
+    /// [`Storage::put_if_absent`] or [`Storage::put_if_version_matches`] on the same path.
+    /// Passing a fabricated version is a programming error; backends are only required to
+    /// reject it.
+    async fn put_if_version_matches(
+        &self,
+        _path: &Path,
+        _payload: Box<dyn PutPayload>,
+        _expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        Err(unsupported_operation_error(
+            self.uri(),
+            "conditional writes",
+        ))
+    }
+
+    /// Downloads the entire content of a "small" file together with its current version, to be
+    /// passed to [`Storage::put_if_version_matches`].
+    ///
+    /// The bytes and the version are read atomically from the same object state. Fails with
+    /// [`StorageErrorKind::NotFound`] if no object exists at `path`, and with
+    /// [`StorageErrorKind::Unsupported`] if the backend cannot version objects; this is the
+    /// default implementation.
+    async fn get_all_with_version(
+        &self,
+        _path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        Err(unsupported_operation_error(self.uri(), "versioned reads"))
+    }
 
     /// Copies the file associated to `Path` into an `AsyncWrite`.
     /// This function is required to call `.flush()` before it successfully returns.
@@ -241,6 +339,13 @@ impl AsMut<File> for DownloadTempFile {
     fn as_mut(&mut self) -> &mut File {
         &mut self.file
     }
+}
+
+/// Builds the error returned by the default implementations of the optional [`Storage`]
+/// operations.
+fn unsupported_operation_error(storage_uri: &Uri, operation: &str) -> StorageError {
+    let message = format!("storage `{storage_uri}` does not support {operation}");
+    StorageErrorKind::Unsupported.with_error(anyhow::anyhow!(message))
 }
 
 #[cfg(test)]

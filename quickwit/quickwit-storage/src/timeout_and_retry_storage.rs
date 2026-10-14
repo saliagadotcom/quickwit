@@ -25,7 +25,8 @@ use tokio::io::AsyncRead;
 
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, ListObjectsStream, PutPayload, Storage, StorageErrorKind, StorageResult,
+    BulkDeleteError, ListObjectsStream, ObjectVersion, PutPayload, Storage, StorageErrorKind,
+    StorageResult,
 };
 
 /// Storage proxy that implements a retry operation if the underlying storage
@@ -129,6 +130,32 @@ impl Storage for TimeoutAndRetryStorage {
 
     async fn get_all(&self, path: &Path) -> StorageResult<OwnedBytes> {
         self.underlying.get_all(path).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        self.underlying.put_if_absent(path, payload).await
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        self.underlying
+            .put_if_version_matches(path, payload, expected_version)
+            .await
+    }
+
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        self.underlying.get_all_with_version(path).await
     }
 
     async fn delete(&self, path: &Path) -> StorageResult<()> {

@@ -120,7 +120,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::{MockStorage, MockStorageCache, OwnedBytes};
+    use crate::{
+        MockStorage, MockStorageCache, OwnedBytes, RamStorage,
+        storage_test_conditional_writes_unsupported,
+    };
 
     #[tokio::test]
     async fn put_in_cache_test() {
@@ -162,5 +165,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data1, data2);
+    }
+
+    /// `StorageWithCache` is a read-only view: it must not forward conditional writes to the
+    /// underlying storage, and it must not serve a cached (possibly stale) object as a versioned
+    /// read either. Failing with `Unsupported` is the only correct answer.
+    #[tokio::test]
+    async fn test_storage_with_cache_does_not_support_conditional_writes() {
+        let storage = StorageWithCache {
+            storage: Arc::new(RamStorage::default()),
+            cache: Arc::new(MockStorageCache::default()),
+        };
+        storage_test_conditional_writes_unsupported(&storage)
+            .await
+            .unwrap();
     }
 }

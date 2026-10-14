@@ -24,8 +24,8 @@ use tokio::io::AsyncRead;
 
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, ListObjectsStream, ObjectMetadata, OwnedBytes, Storage, StorageErrorKind,
-    StorageResult,
+    BulkDeleteError, ListObjectsStream, ObjectMetadata, ObjectVersion, OwnedBytes, Storage,
+    StorageErrorKind, StorageResult,
 };
 
 /// This storage acts as a proxy to another storage that simply modifies each API call
@@ -57,6 +57,36 @@ impl Storage for PrefixStorage {
         payload: Box<dyn crate::PutPayload>,
     ) -> crate::StorageResult<()> {
         self.storage.put(&self.prefix.join(path), payload).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<ObjectVersion> {
+        self.storage
+            .put_if_absent(&self.prefix.join(path), payload)
+            .await
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> crate::StorageResult<ObjectVersion> {
+        self.storage
+            .put_if_version_matches(&self.prefix.join(path), payload, expected_version)
+            .await
+    }
+
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> crate::StorageResult<(OwnedBytes, ObjectVersion)> {
+        self.storage
+            .get_all_with_version(&self.prefix.join(path))
+            .await
     }
 
     async fn copy_to(
@@ -240,7 +270,28 @@ mod tests {
     use futures::{TryStreamExt, stream};
 
     use super::*;
-    use crate::{DeleteFailure, MockStorage};
+    use crate::{DeleteFailure, MockStorage, RamStorage, storage_test_conditional_writes};
+
+    #[tokio::test]
+    async fn test_prefix_storage_conditional_writes() -> anyhow::Result<()> {
+        let ram_storage = Arc::new(RamStorage::default());
+        let storage = add_prefix_to_storage(
+            ram_storage.clone(),
+            PathBuf::from("indexes"),
+            Uri::for_test("ram:///indexes"),
+        );
+        storage_test_conditional_writes(storage.clone()).await?;
+
+        // The prefix is applied to the conditional operations, like to every other operation.
+        let version = storage
+            .put_if_absent(Path::new("metastore.json"), Box::new(b"{}".to_vec()))
+            .await?;
+        let (_, version_seen_without_prefix) = ram_storage
+            .get_all_with_version(Path::new("indexes/metastore.json"))
+            .await?;
+        assert_eq!(version_seen_without_prefix, version);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_prefix_storage_list() {

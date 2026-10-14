@@ -28,7 +28,7 @@ use tantivy::directory::OwnedBytes;
 use tokio::io::AsyncRead;
 
 use crate::storage::SendableAsync;
-use crate::{BulkDeleteError, ListObjectsStream, Storage, StorageResult};
+use crate::{BulkDeleteError, ListObjectsStream, ObjectVersion, Storage, StorageResult};
 
 /// The AsyncDebouncer debounces inflight Futures, so that concurrent async request to the same data
 /// source can be deduplicated.
@@ -173,6 +173,34 @@ impl<T: Storage> Storage for DebouncedStorage<T> {
         payload: Box<dyn crate::PutPayload>,
     ) -> crate::StorageResult<()> {
         self.underlying.put(path, payload).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        self.underlying.put_if_absent(path, payload).await
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        self.underlying
+            .put_if_version_matches(path, payload, expected_version)
+            .await
+    }
+
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        // Versioned reads bypass the debouncer: a compare-and-swap caller needs the state of the
+        // object as of *now*, not a read that another caller started earlier.
+        self.underlying.get_all_with_version(path).await
     }
 
     async fn copy_to(&self, path: &Path, output: &mut dyn SendableAsync) -> StorageResult<()> {
