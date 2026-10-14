@@ -76,7 +76,9 @@ use self::file_backed_index::FileBackedIndex;
 pub use self::file_backed_metastore_factory::FileBackedMetastoreFactory;
 use self::index_id_matcher::IndexIdMatcher;
 use self::lazy_file_backed_index::LazyFileBackedIndex;
-use self::manifest::{MANIFEST_FILE_NAME, load_or_create_manifest, save_manifest};
+use self::manifest::{
+    MANIFEST_FILE_NAME, SaveManifestOutcome, load_manifest, load_or_create_manifest, save_manifest,
+};
 use self::state::MetastoreState;
 use self::store_operations::{
     PutIndexOutcome, create_index_file, delete_index, index_exists, load_index, put_index,
@@ -229,10 +231,10 @@ impl FileBackedMetastore {
         polling_interval_opt: Option<Duration>,
         write_mode: WriteMode,
     ) -> MetastoreResult<Self> {
-        let manifest = load_or_create_manifest(&*storage).await?;
+        let loaded_manifest = load_or_create_manifest(&*storage, write_mode).await?;
         let state = MetastoreState::try_from_manifest(
-            storage.clone(),
-            manifest,
+            &storage,
+            loaded_manifest,
             polling_interval_opt,
             write_mode,
         )?;
@@ -277,28 +279,71 @@ impl FileBackedMetastore {
         locked_index.discarded = true;
     }
 
-    /// Applies `apply` to the in-memory state, saves the resulting manifest and, if the save
-    /// fails, undoes the change with `rollback` before returning the error.
+    /// Applies `apply` to the in-memory state and saves the resulting manifest. If the save
+    /// fails, the change is undone with `rollback` before the error is returned.
     ///
-    /// The `state` write lock is only held while `apply` and `rollback` run, not across the save.
+    /// In [`WriteMode::Conditional`], the save only succeeds if the manifest file was not modified
+    /// since it was last loaded or saved. Otherwise the change is undone, the manifest written by
+    /// the other metastore is adopted and `apply` runs again on top of it, so `apply` and
+    /// `rollback` may run several times and must not have side effects.
+    ///
+    /// The `state` write lock is only held while `apply` and `rollback` run, never across storage
+    /// IO.
     ///
     /// Hidden contract: the caller holds `manifest_lock`.
     async fn update_manifest<Undo>(
         &self,
-        apply: impl FnOnce(&mut MetastoreState) -> MetastoreResult<Undo>,
-        rollback: impl FnOnce(&mut MetastoreState, Undo),
+        mut apply: impl FnMut(&mut MetastoreState) -> MetastoreResult<Undo>,
+        mut rollback: impl FnMut(&mut MetastoreState, Undo),
     ) -> MetastoreResult<()> {
-        let (manifest, undo) = {
-            let mut state_wlock_guard = self.state.write().await;
-            let undo = apply(&mut state_wlock_guard)?;
-            (state_wlock_guard.as_manifest(), undo)
-        };
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-            let mut state_wlock_guard = self.state.write().await;
-            rollback(&mut state_wlock_guard, undo);
-            return Err(error);
+        let mut conflict_retry = ConflictRetry::new(ConditionalObject::Manifest, "manifest");
+
+        loop {
+            let (manifest, expected_version, undo) = {
+                let mut state_wlock_guard = self.state.write().await;
+                let undo = apply(&mut state_wlock_guard)?;
+                let manifest = state_wlock_guard.as_manifest();
+                let expected_version = state_wlock_guard.manifest_version.clone();
+                (manifest, expected_version, undo)
+            };
+            let save_result = save_manifest(
+                &*self.storage,
+                &manifest,
+                self.write_mode,
+                expected_version.as_ref(),
+            )
+            .await;
+            match save_result {
+                Ok(SaveManifestOutcome::Written(version)) => {
+                    self.state.write().await.manifest_version = version;
+                    return Ok(());
+                }
+                Ok(SaveManifestOutcome::Conflict) => {
+                    rollback(&mut *self.state.write().await, undo);
+                    conflict_retry.wait_before_retry().await?;
+                    self.adopt_stored_manifest().await?;
+                }
+                Err(error) => {
+                    rollback(&mut *self.state.write().await, undo);
+                    return Err(error);
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// Reloads the manifest from the storage and replaces the in-memory state with it.
+    ///
+    /// Hidden contract: the caller holds `manifest_lock`, so the in-memory state holds no unsaved
+    /// change that the reset would drop.
+    async fn adopt_stored_manifest(&self) -> MetastoreResult<()> {
+        let loaded_manifest = load_manifest(&*self.storage, self.write_mode).await?;
+        let mut state_wlock_guard = self.state.write().await;
+        state_wlock_guard.reset_from_manifest(
+            &self.storage,
+            loaded_manifest,
+            self.polling_interval_opt,
+            self.write_mode,
+        )
     }
 
     /// Applies `mutate_fn` to the index and writes the result to the storage.
@@ -669,10 +714,10 @@ impl MetastoreService for FileBackedMetastore {
 
         create_index_file(&*self.storage, &mut index, self.write_mode).await?;
 
-        let lazy_index = self.lazy_index(index_id, Some(index));
         // Set state to `Active` and rollback on metastore error.
         self.update_manifest(
             |state| {
+                let lazy_index = self.lazy_index(index_id, Some(index.clone()));
                 state
                     .indexes
                     .insert(index_id.clone(), LazyIndexStatus::Active(lazy_index));
@@ -1442,18 +1487,26 @@ impl MetastoreService for FileBackedMetastore {
         let mut identity = self.state.read().await.identity;
 
         if identity.is_nil() {
-            identity = Uuid::new_v4();
+            let new_identity = Uuid::new_v4();
 
             self.update_manifest(
                 |state| {
-                    state.identity = identity;
-                    Ok(())
+                    // Another metastore may have saved its own identity in the meantime: the
+                    // first one saved wins so that all metastores agree on it.
+                    if !state.identity.is_nil() {
+                        return Ok(false);
+                    }
+                    state.identity = new_identity;
+                    Ok(true)
                 },
-                |state, ()| {
-                    state.identity = Uuid::nil();
+                |state, identity_was_set| {
+                    if identity_was_set {
+                        state.identity = Uuid::nil();
+                    }
                 },
             )
             .await?;
+            identity = self.state.read().await.identity;
         }
 
         Ok(GetClusterIdentityResponse {
@@ -1789,7 +1842,9 @@ mod tests {
         manifest
             .indexes
             .insert(index_id.to_string(), IndexStatus::Active);
-        save_manifest(&*storage, &manifest).await.unwrap();
+        save_manifest(&*storage, &manifest, WriteMode::Unconditional, None)
+            .await
+            .unwrap();
 
         let metastore =
             FileBackedMetastore::try_new(storage.clone(), None, WriteMode::Unconditional)
@@ -2147,7 +2202,10 @@ mod tests {
         ));
         // Check index state is in `Creating` in the manifest file.
         let storage = Arc::new(ram_storage_clone_2.clone());
-        let manifest = load_or_create_manifest(&*storage).await.unwrap();
+        let manifest = load_or_create_manifest(&*storage, WriteMode::Unconditional)
+            .await
+            .unwrap()
+            .manifest;
         assert!(matches!(
             *manifest.indexes.get(index_id).unwrap(),
             IndexStatus::Creating
@@ -2161,7 +2219,10 @@ mod tests {
             deleted_index_error,
             MetastoreError::NotFound { .. }
         ));
-        let manifest = load_or_create_manifest(&*storage).await.unwrap();
+        let manifest = load_or_create_manifest(&*storage, WriteMode::Unconditional)
+            .await
+            .unwrap()
+            .manifest;
         assert!(!manifest.indexes.contains_key(index_id));
         // Now we can expect an `IndexDoesNotExist` error.
         let created_index_error = metastore.get_index(&index_uid).await.unwrap_err();
@@ -2353,7 +2414,9 @@ mod tests {
         manifest
             .indexes
             .insert(index_id_deleting.to_string(), IndexStatus::Deleting);
-        save_manifest(&*ram_storage, &manifest).await.unwrap();
+        save_manifest(&*ram_storage, &manifest, WriteMode::Unconditional, None)
+            .await
+            .unwrap();
 
         let index_alive = FileBackedIndex::from(index_metadata_alive);
         let index_alive_unregistered = FileBackedIndex::from(index_metadata_unregistered);

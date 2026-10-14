@@ -20,10 +20,14 @@ use quickwit_common::uri::Uri;
 use quickwit_config::{IndexTemplate, IndexTemplateId};
 use quickwit_proto::metastore::{MetastoreError, MetastoreResult, serde_utils};
 use quickwit_proto::types::{DocMappingUid, IndexId};
-use quickwit_storage::{OwnedBytes, Storage, StorageError, StorageErrorKind, StorageResult};
+use quickwit_storage::{
+    ObjectVersion, OwnedBytes, Storage, StorageError, StorageErrorKind, StorageResult,
+};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use uuid::Uuid;
+
+use super::WriteMode;
 
 pub(super) const MANIFEST_FILE_NAME: &str = "manifest.json";
 
@@ -167,38 +171,125 @@ impl quickwit_config::TestableForRegression for Manifest {
     }
 }
 
-pub(super) async fn load_or_create_manifest(storage: &dyn Storage) -> MetastoreResult<Manifest> {
-    if file_exists(storage, MANIFEST_FILE_NAME).await? {
-        let manifest_json = get_bytes(storage, MANIFEST_FILE_NAME).await?;
-        let manifest: Manifest = serde_utils::from_json_bytes(&manifest_json)?;
-        return Ok(manifest);
-    }
-    if file_exists(storage, LEGACY_MANIFEST_FILE_NAME).await? {
-        let legacy_manifest_json = get_bytes(storage, LEGACY_MANIFEST_FILE_NAME).await?;
-        let legacy_manifest: LegacyManifest = serde_utils::from_json_bytes(&legacy_manifest_json)?;
-        let manifest = legacy_manifest.into_manifest();
-        save_manifest(storage, &manifest).await?;
-
-        if let Err(storage_error) = delete_file(storage, LEGACY_MANIFEST_FILE_NAME).await {
-            error!(
-                error=%storage_error,
-                "failed to delete legacy manifest file located at `{}/{LEGACY_MANIFEST_FILE_NAME}`", storage.uri()
-            );
-        }
-        return Ok(manifest);
-    }
-    let manifest = Manifest::default();
-    save_manifest(storage, &manifest).await?;
-    Ok(manifest)
+/// A manifest along with the version of the file it was loaded from or written to.
+pub(super) struct LoadedManifest {
+    pub manifest: Manifest,
+    /// Version of the manifest file in [`WriteMode::Conditional`], `None` in
+    /// [`WriteMode::Unconditional`] where versions are not tracked.
+    pub version: Option<ObjectVersion>,
 }
 
+/// Loads the manifest, creating an empty one or migrating the legacy manifest file if there is
+/// none.
+///
+/// In [`WriteMode::Conditional`], several metastores may do so concurrently: exactly one of them
+/// creates the manifest file and the others load the one it created.
+pub(super) async fn load_or_create_manifest(
+    storage: &dyn Storage,
+    write_mode: WriteMode,
+) -> MetastoreResult<LoadedManifest> {
+    if file_exists(storage, MANIFEST_FILE_NAME).await? {
+        return load_manifest(storage, write_mode).await;
+    }
+    let legacy_manifest_exists = file_exists(storage, LEGACY_MANIFEST_FILE_NAME).await?;
+    let manifest = if legacy_manifest_exists {
+        let legacy_manifest_json = get_bytes(storage, LEGACY_MANIFEST_FILE_NAME).await?;
+        let legacy_manifest: LegacyManifest = serde_utils::from_json_bytes(&legacy_manifest_json)?;
+        legacy_manifest.into_manifest()
+    } else {
+        Manifest::default()
+    };
+    let version = match save_manifest(storage, &manifest, write_mode, None).await? {
+        SaveManifestOutcome::Written(version) => version,
+        SaveManifestOutcome::Conflict => {
+            // Another metastore created the manifest file in the meantime.
+            return load_manifest(storage, write_mode).await;
+        }
+    };
+    if legacy_manifest_exists
+        && let Err(storage_error) = delete_file(storage, LEGACY_MANIFEST_FILE_NAME).await
+    {
+        error!(
+            error=%storage_error,
+            "failed to delete legacy manifest file located at `{}/{LEGACY_MANIFEST_FILE_NAME}`", storage.uri()
+        );
+    }
+    Ok(LoadedManifest { manifest, version })
+}
+
+/// Loads the manifest file, which must exist.
+pub(super) async fn load_manifest(
+    storage: &dyn Storage,
+    write_mode: WriteMode,
+) -> MetastoreResult<LoadedManifest> {
+    let path = Path::new(MANIFEST_FILE_NAME);
+    let (manifest_json, version) = match write_mode {
+        WriteMode::Unconditional => (get_bytes(storage, MANIFEST_FILE_NAME).await?, None),
+        WriteMode::Conditional => {
+            let (manifest_json, version) =
+                storage
+                    .get_all_with_version(path)
+                    .await
+                    .map_err(|storage_error| {
+                        into_metastore_error(storage_error, storage.uri(), path, "load")
+                    })?;
+            (manifest_json, Some(version))
+        }
+    };
+    let manifest: Manifest = serde_utils::from_json_bytes(&manifest_json)?;
+    Ok(LoadedManifest { manifest, version })
+}
+
+/// Outcome of a manifest write.
+#[derive(Debug)]
+pub(super) enum SaveManifestOutcome {
+    /// The manifest was written. The version is the one of the written file in
+    /// [`WriteMode::Conditional`], `None` in [`WriteMode::Unconditional`].
+    Written(Option<ObjectVersion>),
+    /// The manifest file is not at the expected version anymore: another writer modified or
+    /// created it. Nothing was written. Never returned in [`WriteMode::Unconditional`].
+    Conflict,
+}
+
+/// Saves the manifest file.
+///
+/// In [`WriteMode::Conditional`], the write only succeeds if the manifest file is still at
+/// `expected_version`, or does not exist yet when `expected_version` is `None`. In
+/// [`WriteMode::Unconditional`], the manifest is written whatever the state of the file.
 pub(super) async fn save_manifest(
     storage: &dyn Storage,
     manifest: &Manifest,
-) -> MetastoreResult<()> {
+    write_mode: WriteMode,
+    expected_version: Option<&ObjectVersion>,
+) -> MetastoreResult<SaveManifestOutcome> {
     let manifest_json_bytes = serde_utils::to_json_bytes_pretty(manifest)?;
-    put_bytes(storage, MANIFEST_FILE_NAME, manifest_json_bytes).await?;
-    Ok(())
+    let path = Path::new(MANIFEST_FILE_NAME);
+
+    if write_mode == WriteMode::Unconditional {
+        put_bytes(storage, MANIFEST_FILE_NAME, manifest_json_bytes).await?;
+        return Ok(SaveManifestOutcome::Written(None));
+    }
+    let payload = Box::new(manifest_json_bytes);
+    let put_result = match expected_version {
+        Some(expected_version) => {
+            storage
+                .put_if_version_matches(path, payload, expected_version)
+                .await
+        }
+        None => storage.put_if_absent(path, payload).await,
+    };
+    match put_result {
+        Ok(version) => Ok(SaveManifestOutcome::Written(Some(version))),
+        Err(storage_error) if storage_error.kind() == StorageErrorKind::PreconditionFailed => {
+            Ok(SaveManifestOutcome::Conflict)
+        }
+        Err(storage_error) => Err(into_metastore_error(
+            storage_error,
+            storage.uri(),
+            path,
+            "save",
+        )),
+    }
 }
 
 async fn delete_file(storage: &dyn Storage, path: &str) -> StorageResult<()> {
@@ -245,6 +336,14 @@ fn into_metastore_error(
                 "failed to access manifest file located at `{uri}/{}`: unauthorized",
                 path.display()
             ),
+        },
+        StorageErrorKind::Unsupported => MetastoreError::Internal {
+            message: format!(
+                "the storage of the manifest file located at `{uri}/{}` does not support the \
+                 conditional writes required by concurrent metastore writers",
+                path.display()
+            ),
+            cause: storage_error.to_string(),
         },
         _ => MetastoreError::Internal {
             message: format!(
@@ -347,7 +446,13 @@ mod tests {
     #[tokio::test]
     async fn test_create_mutate_save_load_manifest() {
         let storage = quickwit_storage::storage_for_test();
-        let mut manifest = load_or_create_manifest(&*storage).await.unwrap();
+        let LoadedManifest {
+            mut manifest,
+            version,
+        } = load_or_create_manifest(&*storage, WriteMode::Unconditional)
+            .await
+            .unwrap();
+        assert!(version.is_none());
 
         assert_eq!(manifest.indexes.len(), 0);
         assert_eq!(manifest.templates.len(), 0);
@@ -367,7 +472,9 @@ mod tests {
             IndexTemplate::for_test("test-template", &["test-index-*"], 100),
         );
 
-        save_manifest(&*storage, &manifest).await.unwrap();
+        save_manifest(&*storage, &manifest, WriteMode::Unconditional, None)
+            .await
+            .unwrap();
 
         let populated_manifest_size = storage
             .get_all(Path::new(MANIFEST_FILE_NAME))
@@ -376,7 +483,10 @@ mod tests {
             .len();
         assert!(populated_manifest_size > empty_manifest_size);
 
-        let manifest = load_or_create_manifest(&*storage).await.unwrap();
+        let LoadedManifest { manifest, .. } =
+            load_or_create_manifest(&*storage, WriteMode::Unconditional)
+                .await
+                .unwrap();
         assert_eq!(manifest.indexes.len(), 1);
         assert_eq!(
             manifest.indexes.get("test-index").unwrap(),
@@ -389,6 +499,59 @@ mod tests {
         assert_eq!(template.template_id, "test-template");
         assert_eq!(template.index_id_patterns, ["test-index-*"]);
         assert_eq!(template.priority, 100);
+    }
+
+    /// In conditional mode, the manifest is created only if absent and saved only on top of the
+    /// version it was loaded at.
+    #[tokio::test]
+    async fn test_conditional_manifest_save_and_load() {
+        let storage = quickwit_storage::storage_for_test();
+        let LoadedManifest {
+            mut manifest,
+            version,
+        } = load_or_create_manifest(&*storage, WriteMode::Conditional)
+            .await
+            .unwrap();
+        let version = version.expect("the version should be tracked in conditional mode");
+
+        // The manifest file now exists: creating it again is a conflict.
+        let outcome = save_manifest(&*storage, &manifest, WriteMode::Conditional, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SaveManifestOutcome::Conflict),
+            "{outcome:?}"
+        );
+
+        manifest
+            .indexes
+            .insert("test-index".to_string(), IndexStatus::Active);
+        let outcome = save_manifest(&*storage, &manifest, WriteMode::Conditional, Some(&version))
+            .await
+            .unwrap();
+        let SaveManifestOutcome::Written(Some(new_version)) = outcome else {
+            panic!("the manifest should be written at a new version: {outcome:?}");
+        };
+        assert_ne!(new_version, version);
+
+        // Saving on top of the stale version is a conflict.
+        let outcome = save_manifest(&*storage, &manifest, WriteMode::Conditional, Some(&version))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SaveManifestOutcome::Conflict),
+            "{outcome:?}"
+        );
+
+        let LoadedManifest { manifest, version } =
+            load_or_create_manifest(&*storage, WriteMode::Conditional)
+                .await
+                .unwrap();
+        assert_eq!(version, Some(new_version));
+        assert_eq!(
+            manifest.indexes.get("test-index"),
+            Some(&IndexStatus::Active)
+        );
     }
 
     #[tokio::test]
@@ -411,7 +574,10 @@ mod tests {
         .await
         .unwrap();
 
-        let manifest = load_or_create_manifest(&*storage).await.unwrap();
+        let LoadedManifest { manifest, .. } =
+            load_or_create_manifest(&*storage, WriteMode::Conditional)
+                .await
+                .unwrap();
         assert_eq!(manifest.indexes.len(), 3);
         assert_eq!(manifest.templates.len(), 0);
 

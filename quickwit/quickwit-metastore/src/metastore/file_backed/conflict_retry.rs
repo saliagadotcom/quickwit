@@ -52,12 +52,14 @@ static CONFLICT_RETRIES_EXHAUSTED_TOTAL: LazyCounter = lazy_counter!(
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ConditionalObject {
     Index,
+    Manifest,
 }
 
 impl ConditionalObject {
     fn as_str(self) -> &'static str {
         match self {
             ConditionalObject::Index => "index",
+            ConditionalObject::Manifest => "manifest",
         }
     }
 }
