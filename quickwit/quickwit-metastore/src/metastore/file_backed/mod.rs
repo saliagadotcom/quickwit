@@ -20,6 +20,7 @@
 mod concurrency_tests;
 #[cfg(test)]
 mod concurrent_writers_tests;
+mod conditional_writes_probe;
 mod conflict_retry;
 pub mod file_backed_index;
 mod file_backed_metastore_factory;

@@ -22,6 +22,8 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_with::{EnumMap, serde_as};
 
+use crate::HumanDuration;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetastoreBackend {
@@ -264,12 +266,38 @@ impl PostgresMetastoreConfig {
     }
 }
 
+/// Node-level configuration of the file-backed metastore.
+///
+/// ```yaml
+/// metastore:
+///   file:
+///     concurrent_writers: true
+///     polling_interval: 30s
+/// ```
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileMetastoreConfig;
+pub struct FileMetastoreConfig {
+    /// Allows several nodes to host the metastore role on the same metastore URI.
+    ///
+    /// When enabled, every write to the metastore files is a conditional write
+    /// (compare-and-swap) and the node refuses to start if the storage backing the
+    /// metastore URI does not support and enforce conditional writes.
+    #[serde(default)]
+    pub concurrent_writers: bool,
+    /// Interval at which the metastore reloads from storage the metastore files written by other
+    /// nodes. Equivalent to the `#polling_interval=30s` fragment of the metastore URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling_interval: Option<HumanDuration>,
+}
 
 impl FileMetastoreConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(polling_interval) = &self.polling_interval {
+            ensure!(
+                !polling_interval.is_zero(),
+                "`polling_interval` must be greater than zero"
+            );
+        }
         Ok(())
     }
 }
@@ -300,6 +328,52 @@ mod tests {
             .into(),
         ]);
         assert_eq!(metastore_configs, expected_metastore_configs);
+
+        let metastore_configs_yaml = r#"
+                file:
+                    concurrent_writers: true
+                    polling_interval: 15s
+            "#;
+        let metastore_configs: MetastoreConfigs =
+            serde_yaml::from_str(metastore_configs_yaml).unwrap();
+        let expected_metastore_configs = MetastoreConfigs(vec![
+            FileMetastoreConfig {
+                concurrent_writers: true,
+                polling_interval: Some(HumanDuration::try_from("15s".to_string()).unwrap()),
+            }
+            .into(),
+        ]);
+        assert_eq!(metastore_configs, expected_metastore_configs);
+    }
+
+    #[test]
+    fn test_file_metastore_config_serde() {
+        let file_metastore_config: FileMetastoreConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(file_metastore_config, FileMetastoreConfig::default());
+        assert!(!file_metastore_config.concurrent_writers);
+        assert!(file_metastore_config.polling_interval.is_none());
+
+        // `metastore: file:` with no payload is still accepted.
+        let metastore_configs: MetastoreConfigs = serde_yaml::from_str("file:").unwrap();
+        assert_eq!(
+            metastore_configs.find_file(),
+            Some(&FileMetastoreConfig::default())
+        );
+
+        // A bare number is not a duration: a unit is required.
+        serde_yaml::from_str::<FileMetastoreConfig>("polling_interval: 30").unwrap_err();
+
+        serde_yaml::from_str::<FileMetastoreConfig>("unknown_field: true").unwrap_err();
+    }
+
+    #[test]
+    fn test_file_metastore_config_validate() {
+        let file_metastore_config = FileMetastoreConfig {
+            concurrent_writers: false,
+            polling_interval: Some(HumanDuration::try_from("0s".to_string()).unwrap()),
+        };
+        let error = file_metastore_config.validate().unwrap_err();
+        assert!(error.to_string().contains("`polling_interval`"));
     }
 
     #[test]
