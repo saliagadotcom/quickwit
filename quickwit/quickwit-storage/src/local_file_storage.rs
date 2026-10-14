@@ -31,9 +31,13 @@ use tracing::warn;
 use crate::metrics::object_storage_get_slice_in_flight_guards;
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, DebouncedStorage, DeleteFailure, OwnedBytes, Storage, StorageError,
-    StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
+    BulkDeleteError, DebouncedStorage, DeleteFailure, ObjectVersion, OwnedBytes, Storage,
+    StorageError, StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
 };
+
+mod conditional_writes;
+
+use conditional_writes::{PutPrecondition, local_file_version};
 
 /// File system compatible storage implementation.
 #[derive(Clone)]
@@ -89,6 +93,36 @@ impl LocalFileStorage {
     async fn delete_single_file(&self, relative_path: &Path) -> StorageResult<()> {
         let full_path = self.full_path(relative_path)?;
         ignore_error_kind!(ErrorKind::NotFound, tokio::fs::remove_file(full_path).await)?;
+        Ok(())
+    }
+
+    /// Writes `payload` to a temporary file in the target directory, then renames it over
+    /// `path`, so readers never observe a partially written file.
+    async fn write_atomically(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> crate::StorageResult<()> {
+        let full_path = self.full_path(path)?;
+        let parent_dir = full_path.parent().ok_or_else(|| {
+            let err = anyhow::anyhow!("no parent directory for {full_path:?}");
+            StorageErrorKind::Internal.with_error(err)
+        })?;
+
+        tokio::fs::create_dir_all(parent_dir).await?;
+        let mut reader = payload.byte_stream().await?.into_async_read();
+        let named_temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
+        let (temp_std_file, temp_filepath) = named_temp_file.into_parts();
+        let mut temp_tokio_file = tokio::fs::File::from_std(temp_std_file);
+        tokio::io::copy(&mut reader, &mut temp_tokio_file).await?;
+        temp_tokio_file.flush().await?;
+        temp_tokio_file.sync_data().await?;
+        temp_filepath
+            .persist(&full_path)
+            .map_err(|err| StorageErrorKind::Io.with_error(err))?;
+        // We also need to sync the parent directory to ensure it
+        // the file move has been persisted on all file systems.
+        tokio::fs::File::open(parent_dir).await?.sync_data().await?;
         Ok(())
     }
 }
@@ -177,27 +211,39 @@ impl Storage for LocalFileStorage {
         path: &Path,
         payload: Box<dyn crate::PutPayload>,
     ) -> crate::StorageResult<()> {
-        let full_path = self.full_path(path)?;
-        let parent_dir = full_path.parent().ok_or_else(|| {
-            let err = anyhow::anyhow!("no parent directory for {full_path:?}");
-            StorageErrorKind::Internal.with_error(err)
-        })?;
+        self.write_atomically(path, payload).await
+    }
 
-        tokio::fs::create_dir_all(parent_dir).await?;
-        let mut reader = payload.byte_stream().await?.into_async_read();
-        let named_temp_file = tempfile::NamedTempFile::new_in(parent_dir)?;
-        let (temp_std_file, temp_filepath) = named_temp_file.into_parts();
-        let mut temp_tokio_file = tokio::fs::File::from_std(temp_std_file);
-        tokio::io::copy(&mut reader, &mut temp_tokio_file).await?;
-        temp_tokio_file.flush().await?;
-        temp_tokio_file.sync_data().await?;
-        temp_filepath
-            .persist(&full_path)
-            .map_err(|err| StorageErrorKind::Io.with_error(err))?;
-        // We also need to sync the parent directory to ensure it
-        // the file move has been persisted on all file systems.
-        tokio::fs::File::open(parent_dir).await?.sync_data().await?;
-        Ok(())
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        self.put_conditional(path, payload, PutPrecondition::Absent)
+            .await
+    }
+
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        self.put_conditional(
+            path,
+            payload,
+            PutPrecondition::MatchVersion(expected_version),
+        )
+        .await
+    }
+
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        let content = self.get_all(path).await?;
+        let version = local_file_version(&content);
+        Ok((content, version))
     }
 
     #[tracing::instrument(

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Azure Blob Storage: support custom endpoints via `endpoint` and `endpoint_suffix` configuration options for sovereign clouds (#6624)
+- Storage: conditional writes (`put_if_absent`, `put_if_version_matches`, `get_all_with_version`) and the `PreconditionFailed` / `Unsupported` error kinds, so a caller can compare-and-swap an object instead of overwriting it. Implemented for S3-compatible (`If-Match` / `If-None-Match`, requires server support), local file (content-hash versions, `flock`-serialized) and RAM storages (#5795)
 
 ### Fixed
 - (Jaeger) Query resource attributes when Jaeger request carries tags
