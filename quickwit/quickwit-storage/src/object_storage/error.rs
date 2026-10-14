@@ -51,6 +51,7 @@ where E: std::error::Error + ToStorageErrorKind + Send + Sync + 'static
                 match response_error.raw().status().as_u16() {
                     404 /* NOT_FOUND */ => StorageErrorKind::NotFound,
                     403 /* UNAUTHORIZED */ => StorageErrorKind::Unauthorized,
+                    412 /* PRECONDITION_FAILED */ => StorageErrorKind::PreconditionFailed,
                     _ => StorageErrorKind::Internal,
                 }
             }
@@ -132,7 +133,20 @@ impl ToStorageErrorKind for CreateMultipartUploadError {
 
 impl ToStorageErrorKind for PutObjectError {
     fn to_storage_error_kind(&self) -> StorageErrorKind {
-        StorageErrorKind::Service
+        // Conditional write outcomes are not modeled as variants by the SDK; they only surface
+        // through the error code. See
+        // <https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html>.
+        match self.code() {
+            // 412: the `If-Match` / `If-None-Match` precondition did not hold.
+            Some("PreconditionFailed") => StorageErrorKind::PreconditionFailed,
+            // 409: another conditional write on the same key is in flight. AWS documents it as
+            // retryable, but the object may have changed in the meantime, so the caller must
+            // re-read before retrying, exactly as for a failed precondition.
+            Some("ConditionalRequestConflict") => StorageErrorKind::PreconditionFailed,
+            // 404: `If-Match` on a key that no longer exists.
+            Some("NoSuchKey") => StorageErrorKind::NotFound,
+            _ => StorageErrorKind::Service,
+        }
     }
 }
 

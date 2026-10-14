@@ -63,9 +63,13 @@ use crate::object_storage::MultiPartPolicy;
 use crate::stable_deref_bytes::into_owned_bytes;
 use crate::storage::SendableAsync;
 use crate::{
-    BulkDeleteError, DeleteFailure, ListObjectsStream, ObjectMetadata, OwnedBytes, Storage,
-    StorageError, StorageErrorKind, StorageResolverError, StorageResult,
+    BulkDeleteError, DeleteFailure, ListObjectsStream, ObjectMetadata, ObjectVersion, OwnedBytes,
+    Storage, StorageError, StorageErrorKind, StorageResolverError, StorageResult,
 };
+
+mod conditional_writes;
+
+use conditional_writes::PutPrecondition;
 
 /// Semaphore to limit the number of concurrent requests to the object store. Some object stores
 /// (R2, SeaweedFs...) return errors when too many concurrent requests are emitted.
@@ -392,13 +396,19 @@ impl S3CompatibleObjectStorage {
         PathBuf::from(relative_key)
     }
 
+    /// Uploads `payload` in a single `PutObject` request and returns the ETag of the written
+    /// object, if the server reported one.
+    ///
+    /// When `precondition_opt` is set, the request carries the matching `If-Match` /
+    /// `If-None-Match` header. A rejected precondition is a permanent error (never retried).
     async fn put_single_part_single_try<'a>(
         &'a self,
         bucket: &'a str,
         key: &'a str,
         payload: Box<dyn crate::PutPayload>,
         len: u64,
-    ) -> Result<(), Retry<StorageError>> {
+        precondition_opt: Option<&'a PutPrecondition<'a>>,
+    ) -> Result<Option<ObjectVersion>, Retry<StorageError>> {
         // For MD5 uploads, compute Content-MD5 before streaming the body.
         // The AWS SDK no-ops ChecksumAlgorithm::Md5, so MD5 must be sent via
         // the legacy Content-MD5 header (same as the multipart path does per part).
@@ -417,7 +427,17 @@ impl S3CompatibleObjectStorage {
         crate::metrics::OBJECT_STORAGE_UPLOAD_NUM_BYTES.inc_by(len);
         let _timer = HistogramTimer::new(&crate::metrics::OBJECT_STORAGE_PUT_OBJECT_DURATION);
 
-        self.s3_client
+        let (if_match_opt, if_none_match_opt): (Option<String>, Option<String>) =
+            match precondition_opt {
+                None => (None, None),
+                Some(PutPrecondition::Absent) => (None, Some("*".to_string())),
+                Some(PutPrecondition::MatchVersion(version)) => {
+                    (Some(version.as_str().to_string()), None)
+                }
+            };
+
+        let put_object_output = self
+            .s3_client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -425,6 +445,8 @@ impl S3CompatibleObjectStorage {
             .content_length(len as i64)
             .set_checksum_algorithm(aws_checksum_algorithm(self.checksum_algorithm))
             .set_content_md5(content_md5)
+            .set_if_match(if_match_opt)
+            .set_if_none_match(if_none_match_opt)
             .send()
             .await
             .inspect_err(|error| {
@@ -441,7 +463,10 @@ impl S3CompatibleObjectStorage {
                     Retry::Permanent(StorageError::from(sdk_error))
                 }
             })?;
-        Ok(())
+        // Some S3-compatible servers omit the ETag from PutObject responses. Only conditional
+        // writes need it, so the caller decides whether its absence is an error.
+        let version_opt = put_object_output.e_tag().map(ObjectVersion::new);
+        Ok(version_opt)
     }
 
     #[tracing::instrument(skip_all)]
@@ -453,7 +478,7 @@ impl S3CompatibleObjectStorage {
     ) -> StorageResult<()> {
         let bucket = &self.bucket;
         aws_retry(&self.retry_params, || async {
-            self.put_single_part_single_try(bucket, key, payload.clone(), len)
+            self.put_single_part_single_try(bucket, key, payload.clone(), len, None)
                 .await
         })
         .await
@@ -938,6 +963,40 @@ impl Storage for S3CompatibleObjectStorage {
             crate::metrics::OBJECT_STORAGE_PUT_ERRORS_TOTAL.inc();
         }
         put_result
+    }
+
+    #[instrument(name = "storage.s3.put_if_absent", level = "debug", skip(self, payload), fields(payload_len = payload.len()))]
+    async fn put_if_absent(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+    ) -> StorageResult<ObjectVersion> {
+        self.put_conditional(path, payload, PutPrecondition::Absent)
+            .await
+    }
+
+    #[instrument(name = "storage.s3.put_if_version_matches", level = "debug", skip(self, payload), fields(payload_len = payload.len(), %expected_version))]
+    async fn put_if_version_matches(
+        &self,
+        path: &Path,
+        payload: Box<dyn crate::PutPayload>,
+        expected_version: &ObjectVersion,
+    ) -> StorageResult<ObjectVersion> {
+        self.put_conditional(
+            path,
+            payload,
+            PutPrecondition::MatchVersion(expected_version),
+        )
+        .await
+    }
+
+    #[instrument(name = "storage.s3.get_all_with_version", level = "debug", skip(self))]
+    async fn get_all_with_version(
+        &self,
+        path: &Path,
+    ) -> StorageResult<(OwnedBytes, ObjectVersion)> {
+        let _permit = REQUEST_SEMAPHORE.acquire().await;
+        self.get_all_with_version_inner(path).await
     }
 
     #[instrument(name = "storage.s3.copy_to", level = "debug", skip(self, output))]
@@ -1726,7 +1785,7 @@ mod tests {
             .unwrap();
     }
 
-    fn make_s3_storage_with_replay(
+    pub(super) fn make_s3_storage_with_replay(
         client: StaticReplayClient,
         checksum_algorithm: quickwit_config::ChecksumAlgorithm,
     ) -> S3CompatibleObjectStorage {
@@ -1737,6 +1796,9 @@ mod tests {
             .http_client(client)
             .credentials_provider(credentials)
             .request_checksum_calculation(request_checksum_calculation(checksum_algorithm))
+            // Mirror production (`quickwit_aws::get_aws_config`): the SDK does not retry, so
+            // every recorded response is observed by `aws_retry`.
+            .retry_config(aws_config::retry::RetryConfig::disabled())
             .build();
         S3CompatibleObjectStorage {
             s3_client: S3Client::from_conf(config),
@@ -1751,7 +1813,7 @@ mod tests {
         }
     }
 
-    fn ok_put_response() -> ReplayEvent {
+    pub(super) fn ok_put_response() -> ReplayEvent {
         ReplayEvent::new(
             http::Request::builder().body(SdkBody::empty()).unwrap(),
             http::Response::builder()

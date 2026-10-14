@@ -20,7 +20,7 @@ pub mod s3_storage_test_suite {
 
     use std::path::PathBuf;
     use std::str::FromStr;
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
 
     use anyhow::Context;
     use quickwit_common::setup_logging_for_tests;
@@ -58,6 +58,13 @@ pub mod s3_storage_test_suite {
         quickwit_storage::storage_test_suite(&mut object_storage)
             .await
             .context("S3 storage test suite failed")
+            .unwrap();
+
+        // Requires an S3 server with conditional writes (`If-Match` / `If-None-Match`), i.e.
+        // LocalStack >= 4.x.
+        quickwit_storage::storage_test_conditional_writes(Arc::new(object_storage))
+            .await
+            .context("S3 conditional writes test suite failed")
             .unwrap();
 
         let mut object_storage =

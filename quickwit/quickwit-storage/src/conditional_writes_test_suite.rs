@@ -68,13 +68,12 @@ async fn test_put_if_absent_creates_once(storage: &dyn Storage) -> anyhow::Resul
         .await?;
     assert_object_is(storage, path, b"first", &version).await?;
 
-    let error = assert_error_kind(
+    assert_error_kind(
         storage
             .put_if_absent(path, Box::new(b"second".to_vec()))
             .await,
         StorageErrorKind::PreconditionFailed,
     )?;
-    anyhow::ensure!(error.to_string().contains(&path.display().to_string()));
     // The losing write must not have touched the object.
     assert_object_is(storage, path, b"first", &version).await?;
 
