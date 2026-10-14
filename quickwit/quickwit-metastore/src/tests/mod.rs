@@ -51,11 +51,14 @@ impl DefaultForTest for MetastoreServiceGrpcClientAdapter<MetastoreServiceGrpcCl
         use quickwit_proto::tonic::transport::Server;
         use quickwit_storage::RamStorage;
 
-        use crate::FileBackedMetastore;
-        let metastore =
-            FileBackedMetastore::try_new(std::sync::Arc::new(RamStorage::default()), None)
-                .await
-                .unwrap();
+        use crate::{FileBackedMetastore, FileBackedWriteMode};
+        let metastore = FileBackedMetastore::try_new(
+            std::sync::Arc::new(RamStorage::default()),
+            None,
+            FileBackedWriteMode::Unconditional,
+        )
+        .await
+        .unwrap();
         let (client, server) = tokio::io::duplex(1024);
         tokio::spawn(async move {
             Server::builder()

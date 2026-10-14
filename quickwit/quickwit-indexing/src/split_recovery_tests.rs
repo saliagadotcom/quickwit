@@ -20,8 +20,9 @@ use quickwit_common::shared_consts::SPLIT_RECOVERY_METADATA_FILE_NAME;
 use quickwit_common::test_utils::wait_until_predicate;
 use quickwit_config::IndexConfig;
 use quickwit_metastore::{
-    CreateIndexRequestExt, FileBackedMetastore, ListSplitsQuery, ListSplitsRequestExt,
-    MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState, StageSplitsRequestExt,
+    CreateIndexRequestExt, FileBackedMetastore, FileBackedWriteMode, ListSplitsQuery,
+    ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata, SplitState,
+    StageSplitsRequestExt,
 };
 use quickwit_proto::metastore::{
     CreateIndexRequest, ListSplitsRequest, MetastoreService, PublishSplitsRequest,
@@ -55,8 +56,12 @@ async fn recover_and_publish_split(
 
     // Simulate a lost metastore by creating the index in a new one. Index creation assigns a
     // new incarnation UID, so the importer explicitly remaps the recovered split to it.
-    let fresh_metastore =
-        FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None).await?;
+    let fresh_metastore = FileBackedMetastore::try_new(
+        Arc::new(RamStorage::default()),
+        None,
+        FileBackedWriteMode::Unconditional,
+    )
+    .await?;
     let index_config = IndexConfig::for_test(index_id, "ram:///recovered-index");
     let recovered_index_uid = fresh_metastore
         .create_index(CreateIndexRequest::try_from_index_config(&index_config)?)

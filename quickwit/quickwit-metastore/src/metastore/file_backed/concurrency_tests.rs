@@ -26,8 +26,8 @@ use quickwit_proto::metastore::{
 use quickwit_proto::types::IndexUid;
 use quickwit_storage::{GatedStorage, RamStorage, Storage};
 
-use super::FileBackedMetastore;
 use super::manifest::MANIFEST_FILE_NAME;
+use super::{FileBackedMetastore, WriteMode};
 use crate::{CreateIndexRequestExt, IndexMetadataResponseExt, ListIndexesMetadataResponseExt};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -77,9 +77,10 @@ async fn index_exists(metastore: &FileBackedMetastore, index_id: &str) -> bool {
 #[tokio::test]
 async fn test_index_creation_blocked_on_manifest_write_does_not_stall_other_indexes() {
     let (gated_storage, gate) = GatedStorage::new(Arc::new(RamStorage::default()));
-    let metastore = FileBackedMetastore::try_new(Arc::new(gated_storage), None)
-        .await
-        .unwrap();
+    let metastore =
+        FileBackedMetastore::try_new(Arc::new(gated_storage), None, WriteMode::Unconditional)
+            .await
+            .unwrap();
     create_index(&metastore, "index-a").await;
 
     let manifest_path = Path::new(MANIFEST_FILE_NAME);
@@ -136,9 +137,10 @@ async fn test_index_creation_blocked_on_manifest_write_does_not_stall_other_inde
 async fn test_concurrent_manifest_updates_are_not_lost() {
     let (gated_storage, gate) = GatedStorage::new(Arc::new(RamStorage::default()));
     let gated_storage: Arc<dyn Storage> = Arc::new(gated_storage);
-    let metastore = FileBackedMetastore::try_new(gated_storage.clone(), None)
-        .await
-        .unwrap();
+    let metastore =
+        FileBackedMetastore::try_new(gated_storage.clone(), None, WriteMode::Unconditional)
+            .await
+            .unwrap();
 
     let manifest_path = Path::new(MANIFEST_FILE_NAME);
     gate.close(manifest_path);
@@ -156,9 +158,10 @@ async fn test_concurrent_manifest_updates_are_not_lost() {
     create_template_1.await.unwrap();
     create_template_2.await.unwrap();
 
-    let reopened_metastore = FileBackedMetastore::try_new(gated_storage, None)
-        .await
-        .unwrap();
+    let reopened_metastore =
+        FileBackedMetastore::try_new(gated_storage, None, WriteMode::Unconditional)
+            .await
+            .unwrap();
     let mut persisted_template_ids: Vec<String> = reopened_metastore
         .list_index_templates(ListIndexTemplatesRequest {})
         .await

@@ -18,6 +18,9 @@
 
 #[cfg(test)]
 mod concurrency_tests;
+#[cfg(test)]
+mod concurrent_writers_tests;
+mod conflict_retry;
 pub mod file_backed_index;
 mod file_backed_metastore_factory;
 mod index_id_matcher;
@@ -68,13 +71,16 @@ use tracing::instrument;
 use ulid::Ulid;
 use uuid::Uuid;
 
+use self::conflict_retry::{ConditionalObject, ConflictRetry};
 use self::file_backed_index::FileBackedIndex;
 pub use self::file_backed_metastore_factory::FileBackedMetastoreFactory;
 use self::index_id_matcher::IndexIdMatcher;
 use self::lazy_file_backed_index::LazyFileBackedIndex;
 use self::manifest::{MANIFEST_FILE_NAME, load_or_create_manifest, save_manifest};
 use self::state::MetastoreState;
-use self::store_operations::{delete_index, index_exists, load_index, put_index};
+use self::store_operations::{
+    PutIndexOutcome, create_index_file, delete_index, index_exists, load_index, put_index,
+};
 use super::{
     AddSourceRequestExt, CreateIndexRequestExt, IndexMetadataResponseExt,
     IndexesMetadataResponseExt, ListIndexesMetadataResponseExt, ListSplitsRequestExt,
@@ -83,6 +89,18 @@ use super::{
 };
 use crate::checkpoint::IndexCheckpointDelta;
 use crate::{IndexMetadata, ListSplitsQuery, MetastoreServiceExt, Split, SplitState};
+
+/// How the metastore writes its files to the storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteMode {
+    /// Files are overwritten blindly. Correct only when this metastore is the sole writer of the
+    /// storage prefix.
+    Unconditional,
+    /// Files are written with compare-and-swap on the version read, and operations whose write
+    /// lost a race reload the file and retry. Several metastores can then share the storage
+    /// prefix without losing updates. Requires a storage that supports conditional writes.
+    Conditional,
+}
 
 /// Status of an index tracked by the metastore.
 pub(crate) enum LazyIndexStatus {
@@ -162,6 +180,7 @@ pub struct FileBackedMetastore {
     manifest_lock: Arc<Mutex<()>>,
     storage: Arc<dyn Storage>,
     polling_interval_opt: Option<Duration>,
+    write_mode: WriteMode,
 }
 
 impl fmt::Debug for FileBackedMetastore {
@@ -169,6 +188,7 @@ impl fmt::Debug for FileBackedMetastore {
         f.debug_struct("FileBackedMetastore")
             .field("storage_uri", self.storage.uri())
             .field("polling_interval_opt", &self.polling_interval_opt)
+            .field("write_mode", &self.write_mode)
             .finish()
     }
 }
@@ -182,6 +202,7 @@ impl FileBackedMetastore {
             manifest_lock: Default::default(),
             storage,
             polling_interval_opt: None,
+            write_mode: WriteMode::Unconditional,
         }
     }
 
@@ -206,17 +227,54 @@ impl FileBackedMetastore {
     pub async fn try_new(
         storage: Arc<dyn Storage>,
         polling_interval_opt: Option<Duration>,
+        write_mode: WriteMode,
     ) -> MetastoreResult<Self> {
         let manifest = load_or_create_manifest(&*storage).await?;
-        let state =
-            MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
+        let state = MetastoreState::try_from_manifest(
+            storage.clone(),
+            manifest,
+            polling_interval_opt,
+            write_mode,
+        )?;
         let metastore = Self {
             state: Arc::new(RwLock::new(state)),
             manifest_lock: Default::default(),
             storage,
             polling_interval_opt,
+            write_mode,
         };
         Ok(metastore)
+    }
+
+    /// Returns a `LazyFileBackedIndex` for `index_id` configured like this metastore, holding
+    /// `index` if already loaded.
+    fn lazy_index(&self, index_id: &str, index: Option<FileBackedIndex>) -> LazyFileBackedIndex {
+        LazyFileBackedIndex::new(
+            self.storage.clone(),
+            index_id.to_string(),
+            self.polling_interval_opt,
+            self.write_mode,
+            index,
+        )
+    }
+
+    /// Drops the cached copy of `index_id` so that the next access reloads it from the storage.
+    ///
+    /// Called when the cached copy cannot be trusted anymore: a write of the index file failed in
+    /// a way that leaves it unknown whether the file was written or not, or the file is known to
+    /// have changed and could not be reloaded. `locked_index` is the cached copy being discarded.
+    async fn discard_cached_index(
+        &self,
+        index_id: &str,
+        locked_index: &mut OwnedMutexGuard<FileBackedIndex>,
+    ) {
+        let mut state_wlock_guard = self.state.write().await;
+        // At this point, we hold both locks.
+        state_wlock_guard.indexes.insert(
+            index_id.to_string(),
+            LazyIndexStatus::Active(self.lazy_index(index_id, None)),
+        );
+        locked_index.discarded = true;
     }
 
     /// Applies `apply` to the in-memory state, saves the resulting manifest and, if the save
@@ -243,53 +301,68 @@ impl FileBackedMetastore {
         Ok(())
     }
 
+    /// Applies `mutate_fn` to the index and writes the result to the storage.
+    ///
+    /// In [`WriteMode::Conditional`], the write only succeeds if the index file was not modified
+    /// since it was loaded; otherwise the index is reloaded and `mutate_fn` is applied again, so
+    /// it may run several times and must not have side effects.
     async fn mutate<T>(
         &self,
         index_uid: &IndexUid,
-        mutate_fn: impl FnOnce(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
+        mut mutate_fn: impl FnMut(&mut FileBackedIndex) -> MetastoreResult<MutationOccurred<T>>,
     ) -> MetastoreResult<T> {
         let index_id = &index_uid.index_id;
         let mut locked_index = self.get_locked_index(index_id).await?;
-        if locked_index.index_uid() != index_uid {
-            return Err(MetastoreError::NotFound(EntityKind::Index {
-                index_id: index_id.to_string(),
-            }));
-        }
-        let mut index = locked_index.clone();
+        let mut conflict_retry =
+            ConflictRetry::new(ConditionalObject::Index, format!("index `{index_id}`"));
 
-        let value = match mutate_fn(&mut index)? {
-            MutationOccurred::Yes(value) => value,
-            MutationOccurred::No(value) => {
-                return Ok(value);
+        loop {
+            if locked_index.index_uid() != index_uid {
+                return Err(MetastoreError::NotFound(EntityKind::Index {
+                    index_id: index_id.to_string(),
+                }));
             }
-        };
-        locked_index.set_recently_modified();
+            let mut index = locked_index.clone();
 
-        let put_result = put_index(&*self.storage, &index).await;
-        match put_result {
-            Ok(()) => {
-                *locked_index = index;
-                Ok(value)
-            }
-            Err(error) => {
-                // For some of the error type here, we cannot know for sure
-                // whether the content was written or not.
-                //
-                // Just to be sure, let's discard the cache.
-                let mut state_wlock_guard = self.state.write().await;
+            let value = match mutate_fn(&mut index)? {
+                MutationOccurred::Yes(value) => value,
+                MutationOccurred::No(value) => {
+                    return Ok(value);
+                }
+            };
+            index.set_recently_modified();
 
-                // At this point, we hold both locks.
-                state_wlock_guard.indexes.insert(
-                    index_id.to_string(),
-                    LazyIndexStatus::Active(LazyFileBackedIndex::new(
-                        self.storage.clone(),
-                        index_id.to_string(),
-                        self.polling_interval_opt,
-                        None,
-                    )),
-                );
-                locked_index.discarded = true;
-                Err(error)
+            let put_result = put_index(&*self.storage, &mut index, self.write_mode).await;
+            match put_result {
+                Ok(PutIndexOutcome::Written) => {
+                    *locked_index = index;
+                    return Ok(value);
+                }
+                Ok(PutIndexOutcome::Conflict) => {
+                    // Another metastore wrote the index file since we loaded it. Nothing was
+                    // written: reload the index and apply the mutation again.
+                    if let Err(error) = conflict_retry.wait_before_retry().await {
+                        self.discard_cached_index(index_id, &mut locked_index).await;
+                        return Err(error);
+                    }
+                    match load_index(&*self.storage, index_id, self.write_mode).await {
+                        Ok(fresh_index) => {
+                            *locked_index = fresh_index;
+                        }
+                        Err(error) => {
+                            self.discard_cached_index(index_id, &mut locked_index).await;
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // For some of the error type here, we cannot know for sure
+                    // whether the content was written or not.
+                    //
+                    // Just to be sure, let's discard the cache.
+                    self.discard_cached_index(index_id, &mut locked_index).await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -389,7 +462,7 @@ impl FileBackedMetastore {
         // If there is an error here, note we do not return right away.
         // That's because we want to observe the property that after one success
         // all subsequent calls will succeed.
-        let index_result = load_index(&*self.storage, index_id).await;
+        let index_result = load_index(&*self.storage, index_id, self.write_mode).await;
 
         // Here we retake the lock, still no io ongoing.
         let mut state_wlock_guard = self.state.write().await;
@@ -404,12 +477,7 @@ impl FileBackedMetastore {
         // We need to instantiate a `LazyFileBackedIndex` that will hold the mutex
         // and take care of spawning the polling if needed.
         let index = index_result?;
-        let lazy_index = LazyFileBackedIndex::new(
-            self.storage.clone(),
-            index_id.to_string(),
-            self.polling_interval_opt,
-            Some(index),
-        );
+        let lazy_index = self.lazy_index(index_id, Some(index));
         let index_mutex = lazy_index.get().await?;
         state_wlock_guard
             .indexes
@@ -559,7 +627,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_id = &index_uid.index_id;
 
         let index_metadata_json = serde_utils::to_json_str(&index_metadata)?;
-        let index = FileBackedIndex::from(index_metadata);
+        let mut index = FileBackedIndex::from(index_metadata);
 
         let _manifest_guard = self.manifest_lock.lock().await;
 
@@ -599,14 +667,9 @@ impl MetastoreService for FileBackedMetastore {
         )
         .await?;
 
-        put_index(&*self.storage, &index).await?;
+        create_index_file(&*self.storage, &mut index, self.write_mode).await?;
 
-        let lazy_index = LazyFileBackedIndex::new(
-            self.storage.clone(),
-            index_id.clone(),
-            self.polling_interval_opt,
-            Some(index),
-        );
+        let lazy_index = self.lazy_index(index_id, Some(index));
         // Set state to `Active` and rollback on metastore error.
         self.update_manifest(
             |state| {
@@ -645,11 +708,11 @@ impl MetastoreService for FileBackedMetastore {
         let index_metadata = self
             .mutate(index_uid, |index| {
                 let mutation_occurred = index.update_index_config(
-                    doc_mapping,
-                    indexing_settings,
-                    ingest_settings,
-                    search_settings,
-                    retention_policy_opt,
+                    doc_mapping.clone(),
+                    indexing_settings.clone(),
+                    ingest_settings.clone(),
+                    search_settings.clone(),
+                    retention_policy_opt.clone(),
                 )?;
                 let index_metadata = index.metadata().clone();
 
@@ -731,8 +794,8 @@ impl MetastoreService for FileBackedMetastore {
         self.mutate(&index_uid, |index| {
             let mut failed_split_ids = Vec::new();
 
-            for split_metadata in splits_metadata {
-                match index.stage_split(split_metadata) {
+            for split_metadata in &splits_metadata {
+                match index.stage_split(split_metadata.clone()) {
                     Ok(()) => {}
                     Err(MetastoreError::FailedPrecondition {
                         entity: EntityKind::Split { split_id },
@@ -767,10 +830,10 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid().clone();
         self.mutate(&index_uid, |index| {
             index.publish_splits(
-                request.staged_split_ids,
-                request.replaced_split_ids,
-                index_checkpoint_delta,
-                request.publish_token_opt.map(|token| token.into()),
+                request.staged_split_ids.clone(),
+                request.replaced_split_ids.clone(),
+                index_checkpoint_delta.clone(),
+                request.publish_token_opt.clone().map(|token| token.into()),
             )?;
             Ok(MutationOccurred::Yes(()))
         })
@@ -788,7 +851,7 @@ impl MetastoreService for FileBackedMetastore {
         self.mutate(&index_uid, |index| {
             index
                 .mark_splits_for_deletion(
-                    request.split_ids,
+                    request.split_ids.clone(),
                     &[
                         SplitState::Staged,
                         SplitState::Published,
@@ -807,7 +870,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid().clone();
 
         self.mutate(&index_uid, |index| {
-            index.delete_splits(request.split_ids)?;
+            index.delete_splits(request.split_ids.clone())?;
             Ok(MutationOccurred::Yes(EmptyResponse {}))
         })
         .await?;
@@ -820,7 +883,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid();
 
         self.mutate(index_uid, |index| {
-            index.add_source(source_config)?;
+            index.add_source(source_config.clone())?;
             Ok(MutationOccurred::Yes(()))
         })
         .await?;
@@ -833,7 +896,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_uid = request.index_uid();
 
         self.mutate(index_uid, |index| {
-            let mutation_occurred = index.update_source(source_config)?;
+            let mutation_occurred = index.update_source(source_config.clone())?;
             Ok(MutationOccurred::from(mutation_occurred))
         })
         .await?;
@@ -1078,7 +1141,7 @@ impl MetastoreService for FileBackedMetastore {
 
         for (index_uid, subrequests) in per_index_uid_subrequests {
             let subresponses = self
-                .mutate(&index_uid, |index| index.open_shards(subrequests))
+                .mutate(&index_uid, |index| index.open_shards(subrequests.clone()))
                 .await?;
             response.subresponses.extend(subresponses);
         }
@@ -1092,7 +1155,7 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<AcquireShardsResponse> {
         let index_uid = request.index_uid().clone();
         let response = self
-            .mutate(&index_uid, |index| index.acquire_shards(request))
+            .mutate(&index_uid, |index| index.acquire_shards(request.clone()))
             .await?;
         Ok(response)
     }
@@ -1104,7 +1167,7 @@ impl MetastoreService for FileBackedMetastore {
     ) -> MetastoreResult<DeleteShardsResponse> {
         let index_uid = request.index_uid().clone();
         let response = self
-            .mutate(&index_uid, |index| index.delete_shards(request))
+            .mutate(&index_uid, |index| index.delete_shards(request.clone()))
             .await?;
         Ok(response)
     }
@@ -1112,7 +1175,7 @@ impl MetastoreService for FileBackedMetastore {
     #[instrument(name = "metastore.file_backed.prune_shards", skip_all, fields(index_uid = %request.index_uid()))]
     async fn prune_shards(&self, request: PruneShardsRequest) -> MetastoreResult<EmptyResponse> {
         let index_uid = request.index_uid().clone();
-        self.mutate(&index_uid, |index| index.prune_shards(request))
+        self.mutate(&index_uid, |index| index.prune_shards(request.clone()))
             .await?;
         Ok(EmptyResponse {})
     }
@@ -1152,7 +1215,7 @@ impl MetastoreService for FileBackedMetastore {
         let delete_task = self
             .mutate(&index_uid, |index| {
                 index
-                    .create_delete_task(delete_query)
+                    .create_delete_task(delete_query.clone())
                     .map(MutationOccurred::Yes)
             })
             .await?;
@@ -1450,11 +1513,20 @@ async fn get_index_metadata(
 #[cfg(test)]
 #[async_trait]
 impl crate::tests::DefaultForTest for FileBackedMetastore {
+    /// Runs the common metastore test suite in [`WriteMode::Conditional`], the mode that
+    /// exercises the most code: every mutation goes through the versioned load, the conditional
+    /// write and the retry loop. [`WriteMode::Unconditional`] is covered by the storage mock tests
+    /// of this module and by the many tests of other crates built on
+    /// `FileBackedMetastore::for_test`.
     async fn default_for_test() -> Self {
         use quickwit_storage::RamStorage;
-        FileBackedMetastore::try_new(Arc::new(RamStorage::default()), None)
-            .await
-            .unwrap()
+        FileBackedMetastore::try_new(
+            Arc::new(RamStorage::default()),
+            None,
+            WriteMode::Conditional,
+        )
+        .await
+        .unwrap()
     }
 }
 
@@ -1494,7 +1566,7 @@ mod tests {
             shards: Vec<Shard>,
         ) {
             self.mutate(index_uid, |index| {
-                index.insert_shards(source_id, shards);
+                index.insert_shards(source_id, shards.clone());
                 Ok(MutationOccurred::Yes(()))
             })
             .await
@@ -1536,9 +1608,10 @@ mod tests {
                 assert!(path == Path::new("manifest.json"));
                 block_on(ram_storage_clone.put(path, put_payload))
             });
-        let metastore = FileBackedMetastore::try_new(Arc::new(mock_storage), None)
-            .await
-            .unwrap();
+        let metastore =
+            FileBackedMetastore::try_new(Arc::new(mock_storage), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
 
         metastore.check_connectivity().await.unwrap();
     }
@@ -1718,9 +1791,10 @@ mod tests {
             .insert(index_id.to_string(), IndexStatus::Active);
         save_manifest(&*storage, &manifest).await.unwrap();
 
-        let metastore = FileBackedMetastore::try_new(storage.clone(), None)
-            .await
-            .unwrap();
+        let metastore =
+            FileBackedMetastore::try_new(storage.clone(), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
 
         // Getting index with inconsistent index ID should raise an error.
         let metastore_error = metastore
@@ -1779,13 +1853,15 @@ mod tests {
     async fn test_file_backed_metastore_polling() -> MetastoreResult<()> {
         let storage = Arc::new(RamStorage::default());
 
-        let metastore_write = FileBackedMetastore::try_new(storage.clone(), None)
-            .await
-            .unwrap();
+        let metastore_write =
+            FileBackedMetastore::try_new(storage.clone(), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
         let polling_interval = Duration::from_millis(20);
-        let metastore_read = FileBackedMetastore::try_new(storage, Some(polling_interval))
-            .await
-            .unwrap();
+        let metastore_read =
+            FileBackedMetastore::try_new(storage, Some(polling_interval), WriteMode::Unconditional)
+                .await
+                .unwrap();
 
         let index_config = IndexConfig::for_test("test-index", "ram:///indexes/test-index");
         let create_index_request =
@@ -2294,9 +2370,10 @@ mod tests {
         .await?;
 
         // Fetch alive indexes metadatas.
-        let metastore = FileBackedMetastore::try_new(ram_storage.clone(), None)
-            .await
-            .unwrap();
+        let metastore =
+            FileBackedMetastore::try_new(ram_storage.clone(), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
         let indexes_metadata = metastore
             .list_indexes_metadata(ListIndexesMetadataRequest::all())
             .await
@@ -2348,9 +2425,10 @@ mod tests {
     #[tokio::test]
     async fn test_monotically_increasing_stamps_by_index() {
         let storage = RamStorage::default();
-        let metastore = FileBackedMetastore::try_new(Arc::new(storage.clone()), None)
-            .await
-            .unwrap();
+        let metastore =
+            FileBackedMetastore::try_new(Arc::new(storage.clone()), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
         let index_id = "test-index-increasing-stamps-by-index";
         let index_config = IndexConfig::for_test(
             index_id,
@@ -2380,9 +2458,10 @@ mod tests {
         assert_eq!(delete_task_2.opstamp, 2);
 
         // Create metastore with data already in the storage.
-        let new_metastore = FileBackedMetastore::try_new(Arc::new(storage), None)
-            .await
-            .unwrap();
+        let new_metastore =
+            FileBackedMetastore::try_new(Arc::new(storage), None, WriteMode::Unconditional)
+                .await
+                .unwrap();
         let delete_task_3 = new_metastore
             .create_delete_task(delete_query.clone())
             .await

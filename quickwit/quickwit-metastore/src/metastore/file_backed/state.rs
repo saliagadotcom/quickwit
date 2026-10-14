@@ -22,10 +22,10 @@ use quickwit_proto::types::IndexId;
 use quickwit_storage::Storage;
 use uuid::Uuid;
 
-use super::LazyIndexStatus;
 use super::index_template_matcher::IndexTemplateMatcher;
 use super::lazy_file_backed_index::LazyFileBackedIndex;
 use super::manifest::{IndexStatus, Manifest};
+use super::{LazyIndexStatus, WriteMode};
 
 #[derive(Default)]
 pub(super) struct MetastoreState {
@@ -40,6 +40,7 @@ impl MetastoreState {
         storage: Arc<dyn Storage>,
         manifest: Manifest,
         polling_interval_opt: Option<Duration>,
+        write_mode: WriteMode,
     ) -> MetastoreResult<Self> {
         let indexes = manifest
             .indexes
@@ -52,6 +53,7 @@ impl MetastoreState {
                         storage.clone(),
                         index_id.clone(),
                         polling_interval_opt,
+                        write_mode,
                         None,
                     );
                     (index_id, LazyIndexStatus::Active(lazy_index))

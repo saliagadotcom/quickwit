@@ -100,10 +100,15 @@ impl Gate {
 
     /// Resolves once at least one writer is parked on `path`.
     pub async fn wait_until_blocked(&self, path: &Path) {
+        self.wait_until_num_blocked(path, 1).await;
+    }
+
+    /// Resolves once at least `num_writers` writers are parked on `path`.
+    pub async fn wait_until_num_blocked(&self, path: &Path, num_writers: usize) {
         self.inner
             .wait_until(|state| match state.parked_writers.get(path) {
-                Some(writers) => !writers.is_empty(),
-                None => false,
+                Some(writers) => writers.len() >= num_writers,
+                None => num_writers == 0,
             })
             .await;
     }

@@ -35,6 +35,7 @@ use quickwit_proto::metastore::{
     OpenShardSubresponse, PruneShardsRequest, SplitStats,
 };
 use quickwit_proto::types::{IndexUid, PublishToken, SourceId, SplitId};
+use quickwit_storage::ObjectVersion;
 use serde::{Deserialize, Serialize};
 use serialize::VersionedFileBackedIndex;
 use shards::Shards;
@@ -73,6 +74,10 @@ pub(crate) struct FileBackedIndex {
     /// it possible to discard this entry if there is an error
     /// while mutating the Index.
     pub discarded: bool,
+    /// Version of the index file this object was loaded from or written as, when the metastore
+    /// writes conditionally. The next write of this index is conditioned on the file still being
+    /// at this version. `None` when the metastore writes unconditionally.
+    storage_version: Option<ObjectVersion>,
 }
 
 #[cfg(any(test, feature = "testsuite"))]
@@ -150,6 +155,7 @@ impl From<IndexMetadata> for FileBackedIndex {
             stamper: Default::default(),
             recently_modified: false,
             discarded: false,
+            storage_version: None,
         }
     }
 }
@@ -185,7 +191,19 @@ impl FileBackedIndex {
             stamper: Stamper::new(last_opstamp),
             recently_modified: false,
             discarded: false,
+            storage_version: None,
         }
+    }
+
+    /// Returns the version of the index file this object reflects, if the metastore writes
+    /// conditionally.
+    pub fn storage_version(&self) -> Option<&ObjectVersion> {
+        self.storage_version.as_ref()
+    }
+
+    /// Records the version of the index file this object reflects.
+    pub fn set_storage_version(&mut self, storage_version: Option<ObjectVersion>) {
+        self.storage_version = storage_version;
     }
 
     /// Sets the `recently_modified` flag to false and returns the previous value.
