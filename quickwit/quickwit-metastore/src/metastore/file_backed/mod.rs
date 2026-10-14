@@ -27,6 +27,7 @@ mod index_id_matcher;
 mod index_template_matcher;
 mod lazy_file_backed_index;
 pub(crate) mod manifest;
+mod manifest_polling;
 mod state;
 mod store_operations;
 
@@ -79,6 +80,7 @@ use self::lazy_file_backed_index::LazyFileBackedIndex;
 use self::manifest::{
     MANIFEST_FILE_NAME, SaveManifestOutcome, load_manifest, load_or_create_manifest, save_manifest,
 };
+use self::manifest_polling::spawn_manifest_polling_task;
 use self::state::MetastoreState;
 use self::store_operations::{
     PutIndexOutcome, create_index_file, delete_index, index_exists, load_index, put_index,
@@ -210,7 +212,8 @@ impl FileBackedMetastore {
 
     /// Sets the polling interval.
     ///
-    /// Only newly accessed indexes will be affected by the change of this setting.
+    /// Only newly accessed indexes will be affected by the change of this setting. The manifest
+    /// polling task, if any, keeps the interval the metastore was created with.
     pub fn set_polling_interval(&mut self, polling_interval_opt: Option<Duration>) {
         self.polling_interval_opt = polling_interval_opt;
     }
@@ -245,6 +248,18 @@ impl FileBackedMetastore {
             polling_interval_opt,
             write_mode,
         };
+        // In `WriteMode::Unconditional`, this metastore is the only writer of the manifest, so
+        // there is nothing to learn from polling it.
+        if let Some(polling_interval) = polling_interval_opt
+            && write_mode == WriteMode::Conditional
+        {
+            spawn_manifest_polling_task(
+                metastore.storage.clone(),
+                Arc::downgrade(&metastore.state),
+                metastore.manifest_lock.clone(),
+                polling_interval,
+            );
+        }
         Ok(metastore)
     }
 

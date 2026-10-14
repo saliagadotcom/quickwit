@@ -45,18 +45,18 @@ use crate::{
     StageSplitsRequestExt,
 };
 
-async fn open_metastore(storage: Arc<dyn Storage>) -> FileBackedMetastore {
+pub(super) async fn open_metastore(storage: Arc<dyn Storage>) -> FileBackedMetastore {
     FileBackedMetastore::try_new(storage, None, WriteMode::Conditional)
         .await
         .unwrap()
 }
 
-fn create_index_request(index_id: &str) -> CreateIndexRequest {
+pub(super) fn create_index_request(index_id: &str) -> CreateIndexRequest {
     let index_config = IndexConfig::for_test(index_id, &format!("ram:///indexes/{index_id}"));
     CreateIndexRequest::try_from_index_config(&index_config).unwrap()
 }
 
-fn create_index_template_request(template_id: &str) -> CreateIndexTemplateRequest {
+pub(super) fn create_index_template_request(template_id: &str) -> CreateIndexTemplateRequest {
     let index_template = IndexTemplate::for_test(template_id, &["test-index-*"], 100);
     CreateIndexTemplateRequest {
         index_template_json: serde_json::to_string(&index_template).unwrap(),
@@ -96,7 +96,7 @@ async fn persisted_split_ids(storage: Arc<dyn Storage>, index_uid: &IndexUid) ->
 }
 
 /// IDs of the indexes the manifest lists as active, as seen by a fresh metastore.
-async fn persisted_index_ids(storage: Arc<dyn Storage>) -> Vec<String> {
+pub(super) async fn persisted_index_ids(storage: Arc<dyn Storage>) -> Vec<String> {
     let fresh_metastore = open_metastore(storage).await;
     let mut index_ids: Vec<String> = fresh_metastore
         .list_indexes_metadata(ListIndexesMetadataRequest::all())
@@ -112,7 +112,7 @@ async fn persisted_index_ids(storage: Arc<dyn Storage>) -> Vec<String> {
     index_ids
 }
 
-async fn template_ids(metastore: &FileBackedMetastore) -> Vec<String> {
+pub(super) async fn template_ids(metastore: &FileBackedMetastore) -> Vec<String> {
     let mut template_ids: Vec<String> = metastore
         .list_index_templates(ListIndexTemplatesRequest {})
         .await
