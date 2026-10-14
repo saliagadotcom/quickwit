@@ -16,6 +16,8 @@
 //! can import `FileBackedIndex` and run backward-compatibility tests. You should not have to
 //! import anything from here directly.
 
+#[cfg(test)]
+mod concurrency_tests;
 pub mod file_backed_index;
 mod file_backed_metastore_factory;
 mod index_id_matcher;
@@ -146,6 +148,18 @@ impl From<bool> for MutationOccurred<()> {
 #[derive(Clone)]
 pub struct FileBackedMetastore {
     state: Arc<RwLock<MetastoreState>>,
+    /// Serializes the operations that change the manifest: index creation and deletion, index
+    /// templates and the cluster identity.
+    ///
+    /// Hidden contracts:
+    /// - such an operation holds this lock from its first read of the state until its last
+    ///   manifest save, so two of them can never interleave and save a stale manifest;
+    /// - the `state` write lock is never held across a manifest save or any other storage IO of
+    ///   these operations, so readers of other indexes do not stall behind storage latency;
+    /// - a reader that finds an index in a transitioning state waits on this lock for the
+    ///   in-flight operation to complete before looking again (see `index`);
+    /// - lock order is `manifest_lock` then `state`.
+    manifest_lock: Arc<Mutex<()>>,
     storage: Arc<dyn Storage>,
     polling_interval_opt: Option<Duration>,
 }
@@ -165,6 +179,7 @@ impl FileBackedMetastore {
     pub fn for_test(storage: Arc<dyn Storage>) -> Self {
         Self {
             state: Default::default(),
+            manifest_lock: Default::default(),
             storage,
             polling_interval_opt: None,
         }
@@ -197,10 +212,35 @@ impl FileBackedMetastore {
             MetastoreState::try_from_manifest(storage.clone(), manifest, polling_interval_opt)?;
         let metastore = Self {
             state: Arc::new(RwLock::new(state)),
+            manifest_lock: Default::default(),
             storage,
             polling_interval_opt,
         };
         Ok(metastore)
+    }
+
+    /// Applies `apply` to the in-memory state, saves the resulting manifest and, if the save
+    /// fails, undoes the change with `rollback` before returning the error.
+    ///
+    /// The `state` write lock is only held while `apply` and `rollback` run, not across the save.
+    ///
+    /// Hidden contract: the caller holds `manifest_lock`.
+    async fn update_manifest<Undo>(
+        &self,
+        apply: impl FnOnce(&mut MetastoreState) -> MetastoreResult<Undo>,
+        rollback: impl FnOnce(&mut MetastoreState, Undo),
+    ) -> MetastoreResult<()> {
+        let (manifest, undo) = {
+            let mut state_wlock_guard = self.state.write().await;
+            let undo = apply(&mut state_wlock_guard)?;
+            (state_wlock_guard.as_manifest(), undo)
+        };
+        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
+            let mut state_wlock_guard = self.state.write().await;
+            rollback(&mut state_wlock_guard, undo);
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn mutate<T>(
@@ -301,10 +341,30 @@ impl FileBackedMetastore {
         }
     }
 
+    /// Returns the index for `index_id` once no creation or deletion of it is in flight.
+    ///
+    /// Called when `index_id` was seen in a transitioning state. Acquiring the manifest lock
+    /// waits for the operation that set it, if any. If the index is still transitioning after
+    /// that, no operation was in flight: the state is left over from a failed creation or
+    /// deletion and an error is returned.
+    async fn index_after_transition(
+        &self,
+        index_id: &str,
+    ) -> MetastoreResult<Arc<Mutex<FileBackedIndex>>> {
+        let _manifest_guard = self.manifest_lock.lock().await;
+        let inner_rlock_guard = self.state.read().await;
+        let Some(index_state) = inner_rlock_guard.indexes.get(index_id) else {
+            return Err(MetastoreError::NotFound(EntityKind::Index {
+                index_id: index_id.to_string(),
+            }));
+        };
+        get_index_mutex(index_id, index_state).await
+    }
+
     /// Returns a FileBackedIndex for the given index_id.
     ///
-    /// If `index_id` is in a transitioning state `Creating` or `Deleting`, it will
-    /// trigger an error.
+    /// If `index_id` is in a transitioning state `Creating` or `Deleting` and no creation or
+    /// deletion is in flight, it will trigger an error.
     /// If `index_id` is not yet in `per_index_metastores` map,
     /// a fetch to the storage will be initiated and might trigger an error.
     ///
@@ -314,8 +374,13 @@ impl FileBackedMetastore {
             // Happy path!
             // If the object is already in our cache then we just return a copy
             let inner_rlock_guard = self.state.read().await;
-            if let Some(index_state) = inner_rlock_guard.indexes.get(index_id) {
-                return get_index_mutex(index_id, index_state).await;
+            match inner_rlock_guard.indexes.get(index_id) {
+                Some(LazyIndexStatus::Active(lazy_index)) => return lazy_index.get().await,
+                Some(LazyIndexStatus::Creating | LazyIndexStatus::Deleting) => {
+                    drop(inner_rlock_guard);
+                    return self.index_after_transition(index_id).await;
+                }
+                None => {}
             }
         }
         // At this point we do not hold our mutex, so we need to do a little dance
@@ -496,7 +561,7 @@ impl MetastoreService for FileBackedMetastore {
         let index_metadata_json = serde_utils::to_json_str(&index_metadata)?;
         let index = FileBackedIndex::from(index_metadata);
 
-        let mut state_wlock_guard = self.state.write().await;
+        let _manifest_guard = self.manifest_lock.lock().await;
 
         // Checking if index already exists is a bit tedious:
         // - first we check the index state: if it's `Active`, return `IndexAlreadyExists` error,
@@ -504,13 +569,9 @@ impl MetastoreService for FileBackedMetastore {
         //   transitioning states.
         // - if the index is not in the index states map, we still need to check the storage as we
         //   don't want to override an existing metadata file.
-        if let Some(index_status) = state_wlock_guard.indexes.get(index_id) {
-            if let LazyIndexStatus::Active(_) = index_status {
-                return Err(MetastoreError::AlreadyExists(EntityKind::Index {
-                    index_id: index_id.to_string(),
-                }));
-            }
-        } else if index_exists(&*self.storage, index_id).await? {
+        let is_in_manifest = self.state.read().await.indexes.contains_key(index_id);
+
+        if !is_in_manifest && index_exists(&*self.storage, index_id).await? {
             return Err(MetastoreError::Internal {
                 message: format!("index {index_id} cannot be created"),
                 cause: format!(
@@ -520,36 +581,47 @@ impl MetastoreService for FileBackedMetastore {
             });
         }
         // Set state to `Creating` and rollback on metastore error.
-        state_wlock_guard
-            .indexes
-            .insert(index_id.clone(), LazyIndexStatus::Creating);
+        self.update_manifest(
+            |state| {
+                if let Some(LazyIndexStatus::Active(_)) = state.indexes.get(index_id) {
+                    return Err(MetastoreError::AlreadyExists(EntityKind::Index {
+                        index_id: index_id.to_string(),
+                    }));
+                }
+                state
+                    .indexes
+                    .insert(index_id.clone(), LazyIndexStatus::Creating);
+                Ok(())
+            },
+            |state, ()| {
+                state.indexes.remove(index_id);
+            },
+        )
+        .await?;
 
-        let manifest = state_wlock_guard.as_manifest();
-
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-            state_wlock_guard.indexes.remove(index_id);
-            return Err(error);
-        }
         put_index(&*self.storage, &index).await?;
 
-        state_wlock_guard.indexes.insert(
+        let lazy_index = LazyFileBackedIndex::new(
+            self.storage.clone(),
             index_id.clone(),
-            LazyIndexStatus::Active(LazyFileBackedIndex::new(
-                self.storage.clone(),
-                index_id.clone(),
-                self.polling_interval_opt,
-                Some(index),
-            )),
+            self.polling_interval_opt,
+            Some(index),
         );
         // Set state to `Active` and rollback on metastore error.
-        let manifest = state_wlock_guard.as_manifest();
-
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-            state_wlock_guard
-                .indexes
-                .insert(index_id.clone(), LazyIndexStatus::Creating);
-            return Err(error);
-        }
+        self.update_manifest(
+            |state| {
+                state
+                    .indexes
+                    .insert(index_id.clone(), LazyIndexStatus::Active(lazy_index));
+                Ok(())
+            },
+            |state, ()| {
+                state
+                    .indexes
+                    .insert(index_id.clone(), LazyIndexStatus::Creating);
+            },
+        )
+        .await?;
 
         let response = CreateIndexResponse {
             index_uid: index_uid.into(),
@@ -593,36 +665,38 @@ impl MetastoreService for FileBackedMetastore {
 
     #[instrument(name = "metastore.file_backed.delete_index", skip_all, fields(index_uid = %request.index_uid()))]
     async fn delete_index(&self, request: DeleteIndexRequest) -> MetastoreResult<EmptyResponse> {
-        // We pick the outer lock here, so that we enter a critical section.
-        let mut state_wlock_guard = self.state.write().await;
+        // We pick the manifest lock here, so that we enter a critical section.
+        let _manifest_guard = self.manifest_lock.lock().await;
 
         let index_id = &request.index_uid().index_id;
-        // If index is neither in `per_index_metastores_wlock` nor on the storage, it does not
-        // exist.
-        if !state_wlock_guard.indexes.contains_key(index_id)
-            && !index_exists(&*self.storage, index_id).await?
-        {
+        // If index is neither in the manifest nor on the storage, it does not exist.
+        let is_in_manifest = self.state.read().await.indexes.contains_key(index_id);
+
+        if !is_in_manifest && !index_exists(&*self.storage, index_id).await? {
             return Err(MetastoreError::NotFound(EntityKind::Index {
                 index_id: index_id.to_string(),
             }));
         }
         // Set state to `Deleting` and keep the previous state in memory in case we need to insert
-        // if an error occurs.
-        let index_state_opt = state_wlock_guard
-            .indexes
-            .insert(index_id.to_string(), LazyIndexStatus::Deleting);
-        let manifest = state_wlock_guard.as_manifest();
-        // On a put error, reinsert the previous state if any.
-        if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-            if let Some(index_state) = index_state_opt {
-                state_wlock_guard
+        // it back if an error occurs.
+        self.update_manifest(
+            |state| {
+                let previous_index_state_opt = state
                     .indexes
-                    .insert(index_id.to_string(), index_state);
-            } else {
-                state_wlock_guard.indexes.remove(index_id);
-            }
-            return Err(error);
-        }
+                    .insert(index_id.to_string(), LazyIndexStatus::Deleting);
+                Ok(previous_index_state_opt)
+            },
+            |state, previous_index_state_opt| {
+                if let Some(previous_index_state) = previous_index_state_opt {
+                    state
+                        .indexes
+                        .insert(index_id.to_string(), previous_index_state);
+                } else {
+                    state.indexes.remove(index_id);
+                }
+            },
+        )
+        .await?;
 
         let delete_result = delete_index(&*self.storage, index_id).await;
 
@@ -630,15 +704,18 @@ impl MetastoreService for FileBackedMetastore {
             &delete_result,
             Ok(()) | Err(MetastoreError::NotFound(EntityKind::Index { .. }))
         ) {
-            state_wlock_guard.indexes.remove(index_id);
-            let manifest = state_wlock_guard.as_manifest();
-
-            if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-                state_wlock_guard
-                    .indexes
-                    .insert(index_id.to_string(), LazyIndexStatus::Deleting);
-                return Err(error);
-            }
+            self.update_manifest(
+                |state| {
+                    state.indexes.remove(index_id);
+                    Ok(())
+                },
+                |state, ()| {
+                    state
+                        .indexes
+                        .insert(index_id.to_string(), LazyIndexStatus::Deleting);
+                },
+            )
+            .await?;
         }
         delete_result.map(|_| EmptyResponse {})
     }
@@ -1130,52 +1207,54 @@ impl MetastoreService for FileBackedMetastore {
             serde_utils::from_json_str(&request.index_template_json)?;
         let template_id = index_template.template_id.clone();
 
-        let mut state_wlock_guard = self.state.write().await;
+        let _manifest_guard = self.manifest_lock.lock().await;
 
-        let evicted_template_opt = match state_wlock_guard.templates.entry(template_id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(index_template.clone());
-                None
-            }
-            Entry::Occupied(mut entry) if request.overwrite => {
-                let evicted_template = entry.insert(index_template.clone());
-                Some(evicted_template)
-            }
-            Entry::Occupied(_) => {
-                return Err(MetastoreError::AlreadyExists(EntityKind::IndexTemplate {
-                    template_id,
-                }));
-            }
-        };
-        if let Err(error) = state_wlock_guard.template_matcher.insert(&index_template) {
-            if let Some(evicted_template) = evicted_template_opt {
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
-            } else {
-                state_wlock_guard.templates.remove(&template_id);
-            }
-            return Err(error);
-        }
-        let manifest = state_wlock_guard.as_manifest();
-        let save_result = save_manifest(&*self.storage, &manifest).await;
-
-        // Rollback on error.
-        if let Err(error) = save_result {
-            if let Some(evicted_template) = evicted_template_opt {
-                state_wlock_guard
-                    .template_matcher
-                    .insert(&evicted_template)
-                    .expect("evicted template should be valid");
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
-            } else {
-                state_wlock_guard.templates.remove(&template_id);
-                state_wlock_guard.template_matcher.remove(&template_id);
-            }
-            return Err(error);
-        }
+        self.update_manifest(
+            |state| {
+                let evicted_template_opt = match state.templates.entry(template_id.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(index_template.clone());
+                        None
+                    }
+                    Entry::Occupied(mut entry) if request.overwrite => {
+                        let evicted_template = entry.insert(index_template.clone());
+                        Some(evicted_template)
+                    }
+                    Entry::Occupied(_) => {
+                        return Err(MetastoreError::AlreadyExists(EntityKind::IndexTemplate {
+                            template_id: template_id.clone(),
+                        }));
+                    }
+                };
+                if let Err(error) = state.template_matcher.insert(&index_template) {
+                    if let Some(evicted_template) = evicted_template_opt {
+                        state
+                            .templates
+                            .insert(evicted_template.template_id.clone(), evicted_template);
+                    } else {
+                        state.templates.remove(&template_id);
+                    }
+                    return Err(error);
+                }
+                Ok(evicted_template_opt)
+            },
+            // Rollback on error.
+            |state, evicted_template_opt| {
+                if let Some(evicted_template) = evicted_template_opt {
+                    state
+                        .template_matcher
+                        .insert(&evicted_template)
+                        .expect("evicted template should be valid");
+                    state
+                        .templates
+                        .insert(evicted_template.template_id.clone(), evicted_template);
+                } else {
+                    state.templates.remove(&template_id);
+                    state.template_matcher.remove(&template_id);
+                }
+            },
+        )
+        .await?;
         Ok(EmptyResponse {})
     }
 
@@ -1255,31 +1334,34 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         request: DeleteIndexTemplatesRequest,
     ) -> MetastoreResult<EmptyResponse> {
-        let mut evicted_templates = Vec::with_capacity(request.template_ids.len());
-        let mut state_wlock_guard = self.state.write().await;
+        let _manifest_guard = self.manifest_lock.lock().await;
 
-        for template_id in &request.template_ids {
-            if let Some(evicted_template) = state_wlock_guard.templates.remove(template_id) {
-                evicted_templates.push(evicted_template);
-                state_wlock_guard.template_matcher.remove(template_id);
-            }
-        }
-        let manifest = state_wlock_guard.as_manifest();
-        let save_result = save_manifest(&*self.storage, &manifest).await;
+        self.update_manifest(
+            |state| {
+                let mut evicted_templates = Vec::with_capacity(request.template_ids.len());
 
-        // Rollback on error.
-        if let Err(error) = save_result {
-            for evicted_template in evicted_templates {
-                state_wlock_guard
-                    .template_matcher
-                    .insert(&evicted_template)
-                    .expect("evicted template should be valid");
-                state_wlock_guard
-                    .templates
-                    .insert(evicted_template.template_id.clone(), evicted_template);
-            }
-            return Err(error);
-        }
+                for template_id in &request.template_ids {
+                    if let Some(evicted_template) = state.templates.remove(template_id) {
+                        evicted_templates.push(evicted_template);
+                        state.template_matcher.remove(template_id);
+                    }
+                }
+                Ok(evicted_templates)
+            },
+            // Rollback on error.
+            |state, evicted_templates| {
+                for evicted_template in evicted_templates {
+                    state
+                        .template_matcher
+                        .insert(&evicted_template)
+                        .expect("evicted template should be valid");
+                    state
+                        .templates
+                        .insert(evicted_template.template_id.clone(), evicted_template);
+                }
+            },
+        )
+        .await?;
         Ok(EmptyResponse {})
     }
 
@@ -1292,21 +1374,27 @@ impl MetastoreService for FileBackedMetastore {
         &self,
         _: GetClusterIdentityRequest,
     ) -> MetastoreResult<GetClusterIdentityResponse> {
-        let mut state_wlock_guard = self.state.write().await;
+        let _manifest_guard = self.manifest_lock.lock().await;
 
-        if state_wlock_guard.identity.is_nil() {
-            state_wlock_guard.identity = Uuid::new_v4();
+        let mut identity = self.state.read().await.identity;
 
-            let manifest = state_wlock_guard.as_manifest();
+        if identity.is_nil() {
+            identity = Uuid::new_v4();
 
-            if let Err(error) = save_manifest(&*self.storage, &manifest).await {
-                state_wlock_guard.identity = Uuid::nil();
-                return Err(error);
-            }
+            self.update_manifest(
+                |state| {
+                    state.identity = identity;
+                    Ok(())
+                },
+                |state, ()| {
+                    state.identity = Uuid::nil();
+                },
+            )
+            .await?;
         }
 
         Ok(GetClusterIdentityResponse {
-            uuid: state_wlock_guard.identity.hyphenated().to_string(),
+            uuid: identity.hyphenated().to_string(),
         })
     }
 }

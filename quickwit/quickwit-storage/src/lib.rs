@@ -31,6 +31,8 @@ mod conditional_writes_test_suite;
 mod counting_storage;
 mod debouncer;
 mod file_descriptor_cache;
+#[cfg(any(test, feature = "testsuite"))]
+mod gated_storage;
 pub mod metrics;
 mod storage;
 mod timeout_and_retry_storage;
@@ -76,6 +78,8 @@ pub use self::conditional_writes_test_suite::{
     storage_test_conditional_writes, storage_test_conditional_writes_unsupported,
 };
 pub use self::counting_storage::{CountingStorage, DownloadCounters};
+#[cfg(any(test, feature = "testsuite"))]
+pub use self::gated_storage::{Gate, GatedStorage};
 pub use self::local_file_storage::{LocalFileStorage, LocalFileStorageFactory};
 #[cfg(feature = "azure")]
 pub use self::object_storage::{AzureBlobStorage, AzureBlobStorageFactory};
