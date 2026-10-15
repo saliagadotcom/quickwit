@@ -72,8 +72,10 @@ You can also configure it to poll the File-Backed Metastore periodically to keep
 
 To configure the polling interval (in seconds), add a URI fragment to the storage URI as follows: `s3://quickwit/my-indexes#polling_interval=30s`
 
+The polling interval can also be set with the `metastore.file.polling_interval` parameter of the [node configuration file](./node-config.md#file-backed-metastore-configuration). If both the URI fragment and the parameter are set, they must agree.
+
 :::note
-The polling interval can be configured in seconds only; other units, such as minutes or hours, are not supported.
+The polling interval can be configured in seconds only in the URI fragment; other units, such as minutes or hours, are not supported there.
 :::
 
 :::tip
@@ -95,5 +97,30 @@ file:///local/indices#polling_interval=30s
 ```
 
 :::caution
-The file-backed metastore does not support multiple instances running at the same time because it does not implement any locking mechanism to prevent concurrent writes from overwriting each other. Ensure that only one file-backed metastore instance is running at all times.
+By default, the file-backed metastore does not support multiple instances running at the same time because their writes overwrite each other. Ensure that only one file-backed metastore instance is running at all times, or enable [concurrent writers](#concurrent-writers).
 :::
+
+### Concurrent writers
+
+Setting `metastore.file.concurrent_writers: true` in the [node configuration file](./node-config.md#file-backed-metastore-configuration) makes it safe to run the `metastore` service on several nodes sharing the same `metastore_uri`, for instance for high availability.
+
+In that mode, every write to a metastore file is a conditional write (compare-and-swap) against the version of the file the node last read. A write that lost a race against another node is rejected by the storage; the node then reloads the file, re-applies the operation and writes again. Updates are never lost, at the cost of extra requests when two nodes write to the same index at the same time.
+
+```yaml
+metastore_uri: s3://my-bucket/indexes
+metastore:
+  file:
+    concurrent_writers: true
+    polling_interval: 30s
+```
+
+Concurrent writers require a storage that supports **and enforces** conditional writes:
+
+- Amazon S3 supports conditional writes natively. Among S3-compatible providers, make sure that the `If-Match` and `If-None-Match` headers are honored, not merely accepted. LocalStack enforces them from version 4.14.
+- Local file system URIs (`file://`) rely on advisory file locks (`flock`). They are safe for several processes on the same host or on a shared file system with working locks, but not on a network file system that ignores locks.
+
+At startup, a node configured with `concurrent_writers: true` writes and deletes a probe object under the metastore URI to verify that the storage enforces conditional writes, and refuses to start otherwise.
+
+A node only observes the index files written by other nodes when it reads them again. Set a [polling interval](#polling-configuration) so that every node keeps a fresh view of the indexes created, deleted and updated by its peers. Until the next poll, a node that lost a race to create an index rejects requests on that index as if its creation were still in progress.
+
+Conflicts are exposed by the `quickwit_metastore_conditional_write_conflicts_total` and `quickwit_metastore_conditional_write_retries_exhausted_total` [metrics](../reference/metrics.md#metastore-metrics). An operation that keeps losing races gives up after a few retries and returns an unavailable error; the client should retry it.

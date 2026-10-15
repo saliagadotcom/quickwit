@@ -162,12 +162,22 @@ impl From<bool> for MutationOccurred<()> {
 /// - on deletion, same story, the metastore deletes an index metadata file present on the storage
 ///   even if the index is not in the map.
 ///
-/// !!! Important note 2: it is strongly advised to restrict the `FileBackedMetastore`
-/// usage to the following use cases:
+/// !!! Important note 2: in [`WriteMode::Unconditional`], it is strongly advised to restrict the
+/// `FileBackedMetastore` usage to the following use cases:
 /// - testing;
 /// - single-node environment;
 /// - multiple-nodes environment with only one writer and readers. In this case, you must be very
 ///   cautious and ensure that your readers are really readers.
+///
+/// In [`WriteMode::Conditional`], several metastores may write to the same storage prefix: every
+/// file is written with compare-and-swap on the version last read, a write that lost a race is
+/// reloaded and re-applied, and the manifest is polled so that indexes created or deleted by other
+/// metastores become visible. Two limitations remain:
+/// - a metastore that lost the race to create an index returns `AlreadyExists` but keeps the index
+///   as `Creating` until the next manifest poll, and fails requests on that index with an internal
+///   error in the meantime;
+/// - deleting an index on one metastore while another is still creating it can leave the index
+///   listed as `Active` in the manifest without an index file; it is then reported as not found.
 #[derive(Clone)]
 pub struct FileBackedMetastore {
     state: Arc<RwLock<MetastoreState>>,

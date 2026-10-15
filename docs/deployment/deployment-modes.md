@@ -32,4 +32,4 @@ Support for native distributed indexing was added with Quickwit 0.9.
 
 ## File-backed metastore limitations
 
-The file-backed metastore is a good fit for standalone and small deployments. However, it does not support multiple instances running at the same time. As long as you can guarantee that no more than one metastore is running at any given time, the file-backed metastore is safe to use. For heavy workloads, we recommend using a PostgreSQL metastore.
+The file-backed metastore is a good fit for standalone and small deployments. However, by default it does not support multiple instances running at the same time. As long as you can guarantee that no more than one metastore is running at any given time, the file-backed metastore is safe to use. To run several metastore instances on the same S3 bucket, for instance for high availability, enable [concurrent writers](../configuration/metastore-config.md#concurrent-writers). For heavy workloads, we recommend using a PostgreSQL metastore.

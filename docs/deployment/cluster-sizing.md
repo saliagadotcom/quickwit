@@ -79,9 +79,11 @@ The Control Plane, Metastore and, Janitor are lightweight components.
   single core and 2GB of RAM. It doesn't require any disk.
 
 - **Metastore**: A cluster must have exactly one Metastore when using the
-  [file-backed metastore](../configuration/metastore-config.md#file-backed-metastore).
-  When using the [PostgreSQL metastore](#postgres-metastore-backend), you can
-  run one or several Metastore pods for high availability (HA). The Metastore
+  [file-backed metastore](../configuration/metastore-config.md#file-backed-metastore),
+  unless [concurrent writers](../configuration/metastore-config.md#concurrent-writers)
+  are enabled. When using the [PostgreSQL metastore](#postgres-metastore-backend)
+  or a file-backed metastore with concurrent writers, you can run one or several
+  Metastore pods for high availability (HA). The Metastore
   requires a single core and 2GB of RAM. For clusters handling hundreds of
   indexes, you may increase the size to 2 cores and 4GB of RAM. It doesn't
   write to disk (when using PostgreSQL, the database handles persistence).

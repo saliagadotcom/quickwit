@@ -60,6 +60,15 @@ All metastore methods are monitored by the 3 metrics:
 
 Examples of operation names: `create_index`, `index_metadata`, `delete_index`, `stage_splits`, `publish_splits`, `list_splits`, `add_source`, ...
 
+File-backed metastores with [concurrent writers](../configuration/metastore-config.md#concurrent-writers) enabled also expose:
+
+| Namespace | Metric Name | Description | Labels | Type |
+| --------- | ----------- | ----------- | ------ | ---- |
+| `quickwit_metastore` | `conditional_write_conflicts_total` | Number of conditional writes that lost a race against another writer | [`object`] | `counter` |
+| `quickwit_metastore` | `conditional_write_retries_exhausted_total` | Number of operations that gave up after their conditional write lost too many races in a row | [`object`] | `counter` |
+
+`object` is either `index` or `manifest`.
+
 PostgreSQL-backed metastores also expose connection pool gauges:
 
 | Namespace | Metric Name | Description | Type |

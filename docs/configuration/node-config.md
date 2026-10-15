@@ -208,7 +208,20 @@ This section may contain one configuration subsection per available metastore im
 
 ### File-backed metastore configuration
 
-File-backed metastore doesn't have any node level configuration. You can configure the poll interval [at the index level](./metastore-config.md#polling-configuration).
+| Property | Description | Default value |
+| --- | --- | --- |
+| `concurrent_writers` | Allows several nodes running the `metastore` service to share the same `metastore_uri`. Every write to the metastore files becomes a conditional write (compare-and-swap) and the node refuses to start if the storage does not enforce conditional writes. See [concurrent writers](./metastore-config.md#concurrent-writers). | `false` |
+| `polling_interval` | Interval at which the metastore reloads the metastore files written by other nodes. Equivalent to the `#polling_interval=30s` [URI fragment](./metastore-config.md#polling-configuration); if both are set, they must agree. | none (no polling) |
+
+Example of a metastore configuration for a file-backed metastore shared by several nodes in YAML format:
+
+```yaml
+metastore_uri: s3://my-bucket/indexes
+metastore:
+  file:
+    concurrent_writers: true
+    polling_interval: 30s
+```
 
 ### PostgreSQL metastore configuration
 
